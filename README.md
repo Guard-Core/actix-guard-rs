@@ -4,7 +4,7 @@ Application-layer security middleware for [actix-web](https://github.com/actix/a
 
 Docs: <https://rennf93.github.io/actix-guard-rs/>
 
-**Status:** Released. Version 1.0.0, published to crates.io. `GuardTransform` and `GuardService` are working actix-web middleware, screened by the engine.
+**Status:** Released. Version 1.1.0, published to crates.io. `GuardTransform` and `GuardService` are working actix-web middleware, screened by the engine.
 
 ## About
 
@@ -135,7 +135,7 @@ actix Web consumes a request's payload as it is read, so the middleware buffers 
 
 ## Engine dependency
 
-The Cargo.toml pins `guard-core-engine` 4.0.4, published to crates.io, and also carries a path pointing at the engine crate inside a sibling `guard-core-rs` checkout (`../guard-core-rs/crates/guard-core-engine`) so local builds and CI compile the engine from source; consumers installing the crate from the registry resolve the engine normally. CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs`.
+The Cargo.toml pins `guard-core-engine` and `guard-core-rs` at 4.1.0 and carries paths pointing at the engine and facade crates inside a sibling `guard-core-rs` checkout so local builds and CI compile them from source. Registry note, stated plainly: the 4.1.0 dists of `guard-core-engine` and `guard-core-rs` are currently yanked on crates.io, so the published 1.1.0 of this crate cannot resolve its engine from the registry alone (a fresh `cargo add actix-guard-rs` falls back to 1.0.0 with engine 4.0.4). Resolution is restored at the synchronized 4.2.0 train; until then the sibling path dependencies are the working route. CI checks out `rennf93/guard-core-rs` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), mirroring the sibling adapter pattern in `tower-guard-rs`.
 
 The engine crate is `guard-core-engine` rather than the `guard-core-rs` facade because the facade currently re-exports only `compiler`, `preprocessor`, and `semantic`; `detect` (the entry point this adapter uses) is not re-exported there yet.
 

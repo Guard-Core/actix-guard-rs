@@ -8,8 +8,8 @@ actix-guard-rs is the actix-web adapter for the Guard ecosystem: an [`actix_web:
 - **Repository**: https://github.com/rennf93/actix-guard-rs
 - **Language**: Rust, edition 2024, MSRV 1.92
 - **License**: MIT OR Apache-2.0
-- **Version**: 0.1.0
-- **Status**: implemented and tested. Not published to crates.io: the engine is a local path dependency until it is tagged (see [Engine Dependency](#engine-dependency)).
+- **Version**: 1.1.0 (published to crates.io)
+- **Status**: implemented, tested, and published. The engine is a path dependency into a sibling `guard-core-rs` checkout; note the crates.io yank below (see [Engine Dependency](#engine-dependency)).
 
 ## Ecosystem Position
 
@@ -18,7 +18,7 @@ guard-core (Python)              <- Reference implementation, spec owner
 └── guard-core-rs (Rust engine)  <- guard-core-engine: detect, preprocessor, semantic, compiler
     ├── tower-guard-rs           <- tower Layer + Service (axum-guard-rs composes it)
     ├── actix-guard-rs (this)    <- actix-web Transform + Service
-    └── rocket-guard-rs          <- Adapter (scaffold)
+    └── rocket-guard-rs          <- Rocket Fairing + request guards (v1.1.0)
 ```
 
 Downstream consumers register `GuardTransform` with `App::wrap` (or wrap any `Service<ServiceRequest>` tree with it directly).
@@ -38,7 +38,7 @@ Downstream consumers register `GuardTransform` with `App::wrap` (or wrap any `Se
 pub fn detect(content: &str, request_context: &str, config: &DetectConfig) -> DetectVerdict
 ```
 
-`DetectConfig` has five public fields and **no `Default` impl**; the ecosystem defaults are pinned in `crate::default_config()` (10 000 / 262 144 / true / 0.7 / 1.0), matching the conformance corpus knobs. `DetectVerdict` carries `is_threat`, `threat_score`, `threats`, `original_length`, `processed_length` and **no response shape at all**: the `403`/`413`/`500` translation lives in this adapter (`src/response.rs`) and follows the ecosystem's plain-text error convention (the bare message, `text/plain; charset=utf-8`).
+`DetectConfig` has five public fields and **no `Default` impl**; the ecosystem defaults are pinned in `crate::default_config()` (10 000 / 262 144 / true / 0.7 / 1.0), matching the conformance corpus knobs. `DetectVerdict` carries `is_threat`, `threat_score`, `threats`, `original_length`, `processed_length` and **no response shape at all**: the `400`/`403`/`413`/`429`/`500` translation lives in this adapter (`src/response.rs`) and follows the ecosystem's plain-text error convention (the bare message, `text/plain; charset=utf-8`).
 
 View mapping (documented in `src/lib.rs` and `src/service.rs::scan_views`):
 
@@ -65,9 +65,10 @@ The next service is shared through an `Rc<S>` (`GuardService`), not cloned: the 
 
 ## Engine Dependency
 
-- `Cargo.toml` declares `guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine" }`.
+- `Cargo.toml` pins `guard-core-engine` and `guard-core-rs` at 4.1.0 with paths into the sibling checkout (`../guard-core-rs/crates/guard-core-engine`, `../guard-core-rs/crates/guard-core-rs`).
+- Registry note, stated plainly: the 4.1.0 dists of `guard-core-engine` and `guard-core-rs` are currently yanked on crates.io, so the published 1.1.0 of this crate cannot resolve its engine from the registry alone (a fresh `cargo add actix-guard-rs` falls back to 1.0.0 with engine 4.0.4). Resolution is restored at the synchronized 4.2.0 train; until then the sibling path dependencies are the working route.
 - **TODO(engine):** switch to the versioned crates.io dependency once `guard-core-rs` is tagged and published.
-- The engine crate is used directly, not the `guard-core-rs` facade crate, because the facade re-exports only `compiler`, `preprocessor`, and `semantic`. If the facade later re-exports `detect`, switching is a one-line change.
+- The engine crate is used directly for `detect`; the facade dependency supplies the pipeline-side modules (events, geo, cloud provider, responses, and the rate-limit/ban stage wiring). The facade re-exports the full engine stage set since 4.1.0.
 - CI checks out `rennf93/guard-core-rs` (branch `master`, moving branch by design, documented in `.github/workflows/ci.yml`) into `../guard-core-rs` before building, mirroring `tower-guard-rs`. Do not replace that with a git dependency without updating the CI comment and this file.
 
 ## Development Commands
@@ -101,7 +102,7 @@ actix-guard-rs/
 - `cargo test` runs 12 unit tests (`src/`), 12 integration tests (`tests/integration.rs`), and 4 doctests (3 run, 1 intentionally `ignore`d syntax sketch). All must pass.
 - Coverage must include: benign passthrough (method/path/header/body preserved byte-for-byte through the rebuilt request), XSS in body, traversal in path, command injection in query (`$(echo id)`, percent-encoded as `$(echo%20id)` because raw spaces are invalid in a URI and the engine's preprocessor decodes it back), XSS in a scanned header, an excluded header not scanned, `413` over the cap, body passthrough under the cap (and exactly at it), inner service errors propagated unswallowed, engine panic to `500`, body read error to `500`, and 24 concurrent requests screened independently via `actix_web::rt::spawn`.
 - The engine-panic test uses `GuardTransform::with_detect_fn`, a `#[cfg(test)]`-only seam. Do not expose a public detector-injection API; production must always call `guard_core_engine::detect::detect`.
-- Payloads are chosen from the spec 4.0.2 conformance corpus so they are guaranteed threats, not guesses. New blocked-path tests should do the same (see `guard-core-rs/conformance/guard-core-spec-4.0.2/cases/`).
+- Payloads are chosen from the spec 4.1.0 conformance corpus so they are guaranteed threats, not guesses. New blocked-path tests should do the same (see `guard-core-rs/conformance/guard-core-spec-4.1.0/cases/`).
 
 ## Code Quality Standards
 
@@ -116,7 +117,7 @@ actix-guard-rs/
 3. **Keep `EXCLUDED_HEADERS` in sync with `tower-guard-rs` and `guard-core-ts`** when it changes, and record the reason in the const's doc comment.
 4. **Run the full local gate before committing**: fmt, clippy, test, doc. CI runs all four.
 5. **Conventional commits** (`feat:`, `fix:`, `docs:`, `ci:`), matching history. No AI attribution in commit messages.
-6. **Document status honestly.** Nothing here is published; say so in the README and crate docs rather than implying a crates.io release.
+6. **Document status honestly.** This crate is published at 1.1.0, but its engine dependency is currently unresolvable from the registry alone (4.1.0 yanked); say so rather than implying a plain `cargo add` works.
 7. **Update the README behavior tables** when the mapping, response shapes, or cap semantics change. The tables are the contract users read.
 
 ## Related Projects
