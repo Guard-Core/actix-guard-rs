@@ -472,6 +472,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#the-rate-limiter-ratelimiter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The rate limiter: RateLimiter
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-ban-stage-ipbanmanager-ipbanconfig" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The ban stage: IpBanManager + IpBanConfig
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#responses" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -676,6 +698,28 @@
     <span class="md-ellipsis">
       
         The IP gate: IpGateConfig
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-rate-limiter-ratelimiter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The rate limiter: RateLimiter
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-ban-stage-ipbanmanager-ipbanconfig" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The ban stage: IpBanManager + IpBanConfig
       
     </span>
   </a>
@@ -938,11 +982,60 @@ known-friendly automation (monitoring probes, VPN egress, a partner's
 server), not immunity: it sets the same skip state a whitelist match sets but
 never adds a deny path and never opens the whitelist gate. The blacklist,
 route rules, and detection still apply to exempt IPs - an attack payload from
-an exempt IP is still <code>403 Suspicious activity detected</code>. The Rust family
-ships no rate limiter, user-agent filter, cloud-provider blocker, or
-violation counter yet; a stage that lands later must skip exactly what the
-reference skips for a whitelist match (<code>is_whitelisted || is_exempt</code>) and
-never skip detection.</p>
+an exempt IP is still <code>400 Suspicious activity detected</code>. The stateful stages
+(<code>GuardTransform::with_rate_limiting</code>, <code>GuardTransform::with_ip_banning</code>) skip
+exactly what the reference skips for a whitelist match
+(<code>is_whitelisted || is_exempt</code>): rate limiting, violation counting, and
+banning. Detection never skips anything.</p>
+<h3 id="the-rate-limiter-ratelimiter">The rate limiter: <code>RateLimiter</code></h3>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">actix_guard_rs</span><span class="p">::{</span><span class="n">GuardTransform</span><span class="p">,</span><span class="w"> </span><span class="n">RateLimitConfig</span><span class="p">,</span><span class="w"> </span><span class="n">RateLimiter</span><span class="p">};</span>
+
+<span class="kd">let</span><span class="w"> </span><span class="n">limiter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">RateLimiter</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">RateLimitConfig</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">enable_rate_limiting</span><span class="p">:</span><span class="w"> </span><span class="nc">true</span><span class="p">,</span>
+<span class="w">    </span><span class="n">rate_limit</span><span class="p">:</span><span class="w"> </span><span class="mi">30</span><span class="p">,</span>
+<span class="w">    </span><span class="n">rate_limit_window</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">    </span><span class="o">..</span><span class="n">RateLimitConfig</span><span class="p">::</span><span class="n">default</span><span class="p">()</span>
+<span class="p">})</span>
+<span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"valid config"</span><span class="p">);</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">transform</span><span class="w"> </span><span class="o">=</span>
+<span class="w">    </span><span class="n">GuardTransform</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">actix_guard_rs</span><span class="p">::</span><span class="n">default_config</span><span class="p">()).</span><span class="n">with_rate_limiting</span><span class="p">(</span><span class="n">limiter</span><span class="p">);</span>
+</code></pre></div>
+<p>The limiter's constructor fails closed on a zero limit or window. Installed
+with <code>GuardTransform::with_rate_limiting</code>, it runs after the IP gate and the
+ban stage, before body buffering and detection: a crossing answers
+<code>429 Too Many Requests</code> with <code>Retry-After: &lt;window seconds&gt;</code>. With
+<code>enable_rate_limit_auto_ban</code> on and IP banning configured, every crossing
+counts one <code>rate_limit</code> violation toward the auto-ban engine; the response
+stays <code>429</code> and the ban bites on the next request. Requests without a peer
+address cannot be attributed and are not rate limited; detection still
+screens them. The limiter is shared across workers through an <code>Arc</code>, and its
+handles are cheaply clonable, so out-of-band handles work alongside it.</p>
+<h3 id="the-ban-stage-ipbanmanager-ipbanconfig">The ban stage: <code>IpBanManager</code> + <code>IpBanConfig</code></h3>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">actix_guard_rs</span><span class="p">::{</span><span class="n">GuardTransform</span><span class="p">,</span><span class="w"> </span><span class="n">IpBanConfig</span><span class="p">,</span><span class="w"> </span><span class="n">IpBanManager</span><span class="p">,</span><span class="w"> </span><span class="n">ThreatBanEntry</span><span class="p">};</span>
+
+<span class="kd">let</span><span class="w"> </span><span class="n">manager</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">IpBanManager</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">IpBanConfig</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">    </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">3600</span><span class="p">,</span>
+<span class="w">    </span><span class="p">[(</span><span class="s">"sqli"</span><span class="p">,</span><span class="w"> </span><span class="n">ThreatBanEntry</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">threshold</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="n">duration</span><span class="p">:</span><span class="w"> </span><span class="mi">1800</span><span class="w"> </span><span class="p">})],</span>
+<span class="p">)</span>
+<span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"valid config"</span><span class="p">);</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">transform</span><span class="w"> </span><span class="o">=</span>
+<span class="w">    </span><span class="n">GuardTransform</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">actix_guard_rs</span><span class="p">::</span><span class="n">default_config</span><span class="p">()).</span><span class="n">with_ip_banning</span><span class="p">(</span><span class="n">manager</span><span class="p">,</span><span class="w"> </span><span class="n">config</span><span class="p">);</span>
+</code></pre></div>
+<p>The config constructor fails closed on an invalid <code>threat_ban_config</code>
+entry. Installed with <code>GuardTransform::with_ip_banning</code>, the ban check runs
+before the limiter: a live ban answers <code>403 Forbidden</code> (<code>IP address banned</code>)
+and banned traffic never consumes rate budget. Every detected threat counts
+its categories per client IP (the reference pipeline's suspicious-activity
+stage), and a crossed <code>threat_ban_config</code> entry or the flat
+<code>auto_ban_threshold</code> bans on the spot, answering <code>403 Forbidden</code>
+(<code>IP has been banned</code>); without a crossing the block keeps the
+<code>400 Bad Request</code> (<code>Suspicious activity detected</code>) shape.
+<code>config.enable_ip_banning = false</code> counts violations but never bans.
+Whitelisted and exempt IPs are never counted, so they can never be
+auto-banned. The store pair is shared across workers through an <code>Arc</code>.</p>
 <h3 id="responses">Responses</h3>
 <table>
 <thead>
@@ -959,9 +1052,24 @@ never skip detection.</p>
 <td><code>Forbidden</code></td>
 </tr>
 <tr>
-<td>Engine flags a view</td>
+<td>A live ban on the client IP</td>
 <td><code>403 Forbidden</code></td>
+<td><code>IP address banned</code></td>
+</tr>
+<tr>
+<td>Rate limit crossed</td>
+<td><code>429 Too Many Requests</code> (+ <code>Retry-After: &lt;window&gt;</code>)</td>
+<td><code>Too many requests</code></td>
+</tr>
+<tr>
+<td>Engine flags a view</td>
+<td><code>400 Bad Request</code></td>
 <td><code>Suspicious activity detected</code></td>
+</tr>
+<tr>
+<td>Engine flags a view and a crossed auto-ban threshold bans on the spot</td>
+<td><code>403 Forbidden</code></td>
+<td><code>IP has been banned</code></td>
 </tr>
 <tr>
 <td>Body exceeds the cap</td>
@@ -998,6 +1106,18 @@ release profile disables that recovery).</p>
 <td><code>"Forbidden"</code></td>
 </tr>
 <tr>
+<td><code>BANNED_MESSAGE</code></td>
+<td><code>"IP address banned"</code></td>
+</tr>
+<tr>
+<td><code>ACTIVITY_BANNED_MESSAGE</code></td>
+<td><code>"IP has been banned"</code></td>
+</tr>
+<tr>
+<td><code>RATE_LIMITED_MESSAGE</code></td>
+<td><code>"Too many requests"</code></td>
+</tr>
+<tr>
 <td><code>OVERSIZE_MESSAGE</code></td>
 <td><code>"Payload too large"</code></td>
 </tr>
@@ -1011,7 +1131,12 @@ release profile disables that recovery).</p>
 <p><code>DetectConfig</code>, <code>DetectVerdict</code>, and <code>Threat</code> are re-exported from
 <code>guard_core_engine::detect</code>.</p>
 <p><code>IpGateConfig</code>, <code>IpGateDecision</code>, <code>IpGateDenial</code>, <code>IpGateError</code>, and
-<code>IpGateVerdict</code> are re-exported from <code>guard_core_engine::ip_gate</code>. A <code>DetectVerdict</code> carries <code>is_threat</code>, a
+<code>IpGateVerdict</code> are re-exported from <code>guard_core_engine::ip_gate</code>.</p>
+<p><code>RateLimiter</code>, <code>RateLimitConfig</code>, <code>RateLimitConfigError</code>, and
+<code>RateLimitDecision</code> are re-exported from <code>guard_core_engine::rate_limit</code>.</p>
+<p><code>IpBanManager</code>, <code>IpBanConfig</code>, <code>IpBanConfigError</code>, <code>BanError</code>, <code>BanRecord</code>,
+<code>Clock</code>, <code>ResolvedBan</code>, <code>ThreatBanEntry</code>, and <code>ViolationCounters</code> are
+re-exported from <code>guard_core_engine::ip_ban</code>. A <code>DetectVerdict</code> carries <code>is_threat</code>, a
 <code>threat_score</code>, and the list of <code>Threat</code> findings (regex or semantic).</p>
 
 

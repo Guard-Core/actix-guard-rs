@@ -571,12 +571,12 @@ path dependency, so building them locally requires a sibling
 <tr>
 <td><code>GET /search?q=...</code></td>
 <td>guarded</td>
-<td><code>200 search ok</code>, or <code>403</code> when the query trips the engine</td>
+<td><code>200 search ok</code>, or <code>400</code> when the query trips the engine</td>
 </tr>
 <tr>
 <td><code>POST /echo</code></td>
 <td>guarded</td>
-<td>echoes the body; <code>403</code> for a threat, <code>413</code> over the body cap</td>
+<td>echoes the body; <code>400</code> for a threat, <code>413</code> over the body cap</td>
 </tr>
 </tbody>
 </table>
@@ -669,12 +669,12 @@ configuration, and <code>GET /health</code> is registered in front of both guard
 <tr>
 <td><code>GET /search?q=...</code></td>
 <td>general</td>
-<td><code>200</code>, or <code>403</code> on a threat</td>
+<td><code>200</code>, or <code>400</code> on a threat</td>
 </tr>
 <tr>
 <td><code>POST /echo</code></td>
 <td>general</td>
-<td>echoes the body; <code>403</code>/<code>413</code> from the guard</td>
+<td>echoes the body; <code>400</code>/<code>413</code> from the guard</td>
 </tr>
 <tr>
 <td><code>GET /admin/stats</code></td>

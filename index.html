@@ -664,9 +664,29 @@ reference adapters do not scan the method either.</p>
 </thead>
 <tbody>
 <tr>
-<td>Engine flags a view</td>
+<td>The IP gate denies the client IP</td>
 <td><code>403 Forbidden</code></td>
+<td><code>Forbidden</code></td>
+</tr>
+<tr>
+<td>A live ban on the client IP</td>
+<td><code>403 Forbidden</code></td>
+<td><code>IP address banned</code></td>
+</tr>
+<tr>
+<td>Rate limit crossed</td>
+<td><code>429 Too Many Requests</code> (+ <code>Retry-After: &lt;window&gt;</code>)</td>
+<td><code>Too many requests</code></td>
+</tr>
+<tr>
+<td>Engine flags a view</td>
+<td><code>400 Bad Request</code></td>
 <td><code>Suspicious activity detected</code></td>
+</tr>
+<tr>
+<td>Engine flags a view and a crossed auto-ban threshold bans on the spot</td>
+<td><code>403 Forbidden</code></td>
+<td><code>IP has been banned</code></td>
 </tr>
 <tr>
 <td>Body exceeds the cap</td>
