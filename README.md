@@ -50,6 +50,21 @@ One engine call per request view, mirroring the mapping used by the sibling adap
 
 The HTTP method is not fed to the engine: the engine's `detect(content, context, config)` takes content plus a context, and the reference adapters do not scan the method either.
 
+## Engine surfaces (public config)
+
+Every stateful decision and emission runs through the engine facade's rate-limit stage, configured through `GuardTransform` builders:
+
+| Surface | Builder / idiom |
+|---|---|
+| Rate-limit tiers | `.with_route_tiers(resolver)` (`path -> Option<RouteRateLimits>`; a `RouteRateLimits` request extension wins), `.with_geo_handler(handler)` (geo tiers) |
+| Detection exclusions | `.with_detection_exclusions(config)` (global `excluded_detection_headers/params/body_fields`, `enabled_detection_categories`, `detection_scan_body`); per route via a `RouteDetectionExclusions` request extension (a non-`None` route value replaces the global set; headers always merge) |
+| Events + log settings | `.with_event_bus(bus)` (`SecurityEventBus` hook registration), `.with_observability(config)` (`log_suspicious_level`, `muted_check_logs`, the `log_sensitive_headers/params/body_fields` redaction sets) |
+| `on_block` + custom errors | `.with_on_block(hook)`, `.with_custom_error_responses(map)` (status-to-body overrides on every block answer, including the `400` detection block) |
+| Distributed mode | `.with_distributed_store(window_store, prefix, fail_open)` + `.with_distributed_ban_store(ban_store)` (fail-closed backend errors answer `503 Redis rate limiting unavailable`) |
+| Passive mode | `.with_passive_mode(true)` (windows and counters still record, log lines and events still fire, no `400`/`403`/`429` renders, auto-ban feeds suppressed) |
+
+Scan notes: the query string is scanned as `parse_qsl`-decoded per-parameter pairs (what makes `excluded_detection_params` functional), and excluded headers scan with their known false-positive categories suppressed (`ssrf` for address-chain values) instead of a blanket skip.
+
 ## Responses
 
 | Situation | Status | Body |
@@ -57,6 +72,7 @@ The HTTP method is not fed to the engine: the engine's `detect(content, context,
 | The IP gate denies the client IP | `403 Forbidden` | `Forbidden` |
 | A live ban on the client IP | `403 Forbidden` | `IP address banned` |
 | Rate limit crossed | `429 Too Many Requests` (+ `Retry-After: <window>`) | `Too many requests` |
+| The distributed backend fails with `redis_fail_open = false` | `503 Service Unavailable` | `Redis rate limiting unavailable` |
 | Engine flags a view | `400 Bad Request` | `Suspicious activity detected` |
 | Engine flags a view and a crossed auto-ban threshold bans on the spot | `403 Forbidden` | `IP has been banned` |
 | Body exceeds the cap | `413 Payload Too Large` | `Payload too large` |

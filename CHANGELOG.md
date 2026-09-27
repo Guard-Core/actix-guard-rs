@@ -6,6 +6,24 @@ All notable changes to this project.
 
 ### Added
 
+- The wave surfaces are publicly configurable on `GuardTransform`, each wired to the engine facade's rate-limit stage (`guard_core_rs::tower::RateLimitStage`, which the transform now builds and delegates every stateful decision and emission to):
+  - `with_route_tiers(resolver)` (`path -> Option<RouteRateLimits>`; a `RouteRateLimits` request extension wins over the resolver) and `with_geo_handler(Arc<dyn GeoIpHandler>)`: the reference's endpoint/route/geo rate-limit tiers; the first tier that crosses answers the same `429 + Retry-After` shape and feeds the auto-ban engine
+  - `with_detection_exclusions(DetectionExclusionConfig)` plus the `RouteDetectionExclusions` request extension: the reference per-route detection-exclusion surface, resolved per request through the engine's `detection_exclusions::resolve` + `scan_request`
+  - `with_event_bus(Arc<SecurityEventBus>)`: the `penetration_attempt`/`rate_limited`/`ip_banned` events with the reference fields, metadata, and redaction
+  - `with_observability(ObservabilityConfig)`: `log_suspicious_level`, `muted_check_logs`, and the `log_sensitive_headers/params/body_fields` redaction sets
+  - `with_on_block(OnBlockHook)` and `with_custom_error_responses(CustomErrorResponses)`: the hook fires exactly once per blocked request (and per passive-flagged detection with no status); the status-to-body map overrides every block body, the `400` detection block included
+  - `with_distributed_store(window_store, redis_prefix, redis_fail_open)` + `with_distributed_ban_store(store)`: the reference distributed mode (fail-closed backend errors answer `503 "Redis rate limiting unavailable"`, `fail_open = true` degrades to the in-memory window)
+  - `with_passive_mode(bool)`: the reference passive mode - windows and counters record, log lines and events fire, no block ever renders
+- New re-exports: `DetectionExclusionConfig`, `RouteDetectionExclusions`, `GeoIpHandler`, `BanStore`, `SlidingWindowStore`, `ViolationCounters`, `RouteRateLimits`, `RateLimitEntry`, `RateLimitTier`, `TierDecision`, `SecurityEventBus`, `ObservabilityConfig`, `RequestObservation`, `StageResponse`, `BlockPayload`, `OnBlockHook`, `CustomErrorResponses`
+
+### Changed
+
+- `guard-core-rs` (the engine facade) joins `guard-core-engine` as a pinned 4.1.0 dependency with the sibling-checkout path fallback; the stage delegation is an implementation detail behind the existing `with_rate_limiting`/`with_ip_banning` signatures, which keep their shared-handle semantics through the stage builder's `limiter`/`ban_manager` injection seams
+- Scan semantics move onto the engine's reference surface: the query string is scanned as `parse_qsl`-decoded per-parameter pairs (previously one raw encoded blob), and the headers the exclusion resolution marks are scanned with their known false-positive categories suppressed (`ssrf` for address-chain values) instead of an adapter-level blanket skip. Exempt IPs now feed the violation counters (the reference suspicious-activity stage skips a whitelisted IP only; detection still scans and blocks them), so a crossed threshold bans even an exempt attacker
+
+
+### Added
+
 - Stateful stage (rate limiting, dynamic bans, auto-ban) over the engine's `rate_limit` and `ip_ban` modules, mirroring the tower reference implementation:
   - `GuardTransform::with_rate_limiting(RateLimiter)`: the sliding-window limiter runs after the IP gate and the ban check, before body buffering - a crossing answers `429 Too Many Requests` with `Retry-After: <window seconds>`, the references' rate-limit shape. With the limiter's `enable_rate_limit_auto_ban` on, every crossing counts one `rate_limit` violation toward the auto-ban engine (`threat_ban_config["rate_limit"]` first, then the flat threshold), the reference pipeline's `_record_rate_limit_autoban`
   - `GuardTransform::with_ip_banning(IpBanManager, IpBanConfig)`: a live ban answers `403 Forbidden` (`IP address banned`) before the limiter, so banned traffic never consumes rate budget; every detected threat counts its categories per client IP (the reference pipeline's suspicious-activity stage) and a crossed `threat_ban_config` entry or the flat `auto_ban_threshold` bans on the spot, answering `403 Forbidden` (`IP has been banned`); `config.enable_ip_banning = false` counts violations but never bans; the plain detection block keeps the reference suspicious-activity stage's `400 Bad Request` (`Suspicious activity detected`) shape
