@@ -82,7 +82,6 @@ The bodies follow the ecosystem's plain-text error convention (the bare message,
 
 Engine panics are caught with `catch_unwind` on the worker thread, so a detected panic still produces a response instead of unwinding out of the request future. `panic = "abort"` in the release profile disables that recovery.
 
-
 ## Rate limiting and IP banning
 
 Two opt-in builder methods install the engine's stateful stage, mirroring the reference pipeline's order (ban check first, then the limiter, both before body buffering and detection):
