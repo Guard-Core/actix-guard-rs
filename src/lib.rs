@@ -61,6 +61,28 @@
 //! The inner service therefore observes the request exactly as the client
 //! sent it, body included.
 //!
+//! ## Engine surfaces (the 4.2.0 wave, all publicly configurable)
+//!
+//! Every stateful decision and emission goes through the engine facade's
+//! rate-limit stage (`guard_core_rs::tower::RateLimitStage`); the
+//! transform's builders are the public configuration:
+//!
+//! | Surface | Builder / idiom |
+//! |---|---|
+//! | Rate-limit tiers | [`GuardTransform::with_route_tiers`] (`path -> Option<RouteRateLimits>`, a [`RouteRateLimits`] request extension wins), [`GuardTransform::with_geo_handler`] (geo tiers) |
+//! | Detection exclusions | [`GuardTransform::with_detection_exclusions`] (global), a [`RouteDetectionExclusions`] request extension (per route) |
+//! | Events + log settings | [`GuardTransform::with_event_bus`], [`GuardTransform::with_observability`] (`log_suspicious_level`, `muted_check_logs`, the `log_sensitive_*` redaction sets) |
+//! | `on_block` + custom errors | [`GuardTransform::with_on_block`], [`GuardTransform::with_custom_error_responses`] |
+//! | Distributed mode | [`GuardTransform::with_distributed_store`] + [`GuardTransform::with_distributed_ban_store`] |
+//! | Passive mode | [`GuardTransform::with_passive_mode`] (log-only: windows and counters record, no block renders, auto-ban feeds suppressed) |
+//!
+//! Scan semantics note: the query string is now scanned as `parse_qsl`-
+//! decoded per-parameter pairs (the reference reads decoded values), which
+//! is what makes `excluded_detection_params` functional, and the header
+//! set the resolution marks as excluded scans with its known
+//! false-positive categories suppressed (`ssrf` for address-chain values)
+//! instead of a blanket skip.
+//!
 //! ## Responses
 //!
 //! | Situation | Status | Body |
@@ -135,6 +157,11 @@ use actix_web::Error;
 use actix_web::body::MessageBody;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
 pub use guard_core_engine::detect::{DetectConfig, DetectVerdict, Threat};
+pub use guard_core_engine::detection_exclusions::{
+    DetectionExclusionConfig, RouteDetectionExclusions,
+};
+pub use guard_core_engine::distributed::{BanStore, SlidingWindowStore};
+pub use guard_core_engine::geo::GeoIpHandler;
 pub use guard_core_engine::ip_ban::{
     BanError, BanRecord, Clock, IpBanConfig, IpBanConfigError, IpBanManager, ResolvedBan,
     ThreatBanEntry, ViolationCounters,
@@ -143,8 +170,12 @@ pub use guard_core_engine::ip_gate::{
     IpGateConfig, IpGateDecision, IpGateDenial, IpGateError, IpGateVerdict,
 };
 pub use guard_core_engine::rate_limit::{
-    RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimiter,
+    RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
+    RateLimiter, RouteRateLimits, TierDecision,
 };
+pub use guard_core_rs::events::SecurityEventBus;
+pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
+pub use guard_core_rs::tower::{ObservabilityConfig, RequestObservation, StageResponse};
 
 pub use crate::response::{
     ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE,
@@ -152,7 +183,7 @@ pub use crate::response::{
 };
 pub use crate::service::GuardService;
 
-use std::net::IpAddr;
+use guard_core_rs::tower::{RateLimitStage, RateLimitStageConfig, RouteRateResolver};
 use std::sync::Arc;
 
 /// Reference default detection configuration.
@@ -189,16 +220,11 @@ pub const fn default_config() -> DetectConfig {
     }
 }
 
-/// Engine entry point stored in the transform.
-///
-/// Indirection exists so unit tests can substitute a panicking detector and
-/// exercise the fail-secure path; production builds always store
-/// [`guard_core_engine::detect::detect`].
-pub(crate) type DetectFn = fn(&str, &str, &DetectConfig) -> DetectVerdict;
-
 /// The stateful stage's ban half: the shared ban store, the shared violation
 /// counters (one middleware instance = one store pair), and the config that
-/// gates banning and threshold resolution.
+/// gates banning and threshold resolution. The pair is injected into the
+/// engine stage (`RateLimitStageBuilder::ban_manager`), so out-of-band
+/// handles stay authoritative.
 pub(crate) struct BanState {
     manager: IpBanManager,
     counters: ViolationCounters,
@@ -211,20 +237,6 @@ impl core::fmt::Debug for BanState {
             .field("manager", &self.manager)
             .field("config", &self.config)
             .finish_non_exhaustive()
-    }
-}
-
-impl BanState {
-    /// The auto-ban engine's one-call shape: count the categories, resolve
-    /// the thresholds, ban when one crossed.
-    pub(crate) fn register_violations(
-        &self,
-        ip: IpAddr,
-        categories: &[&str],
-        reason: &str,
-    ) -> Option<ResolvedBan> {
-        self.manager
-            .register_violations(&self.counters, ip, categories, &self.config, reason)
     }
 }
 
@@ -242,14 +254,25 @@ impl BanState {
 /// The transform applies to every request routed after it. Wrapped services
 /// are shared through an `Rc` (see [`GuardService`]); actix Web builds its
 /// service tree per worker, so this is free and never crosses threads.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GuardTransform {
     config: DetectConfig,
     body_cap: usize,
     ip_gate: Option<IpGateConfig>,
     rate_limiter: Option<Arc<RateLimiter>>,
     ban_state: Option<Arc<BanState>>,
-    detect_fn: DetectFn,
+    route_tiers: Option<RouteRateResolver>,
+    geo_handler: Option<Arc<dyn GeoIpHandler>>,
+    events: Option<Arc<SecurityEventBus>>,
+    observability: Option<ObservabilityConfig>,
+    on_block: Option<OnBlockHook>,
+    custom_error_responses: CustomErrorResponses,
+    passive_mode: bool,
+    distributed: Option<(Arc<dyn SlidingWindowStore>, String, bool)>,
+    distributed_ban_store: Option<Arc<dyn BanStore>>,
+    detection_exclusions: Option<DetectionExclusionConfig>,
+    scan_fn: ScanFn,
+    stage: Option<Arc<RateLimitStage>>,
 }
 
 impl GuardTransform {
@@ -268,7 +291,18 @@ impl GuardTransform {
             ip_gate: None,
             rate_limiter: None,
             ban_state: None,
-            detect_fn: guard_core_engine::detect::detect,
+            route_tiers: None,
+            geo_handler: None,
+            events: None,
+            observability: None,
+            on_block: None,
+            custom_error_responses: CustomErrorResponses::new(),
+            passive_mode: false,
+            distributed: None,
+            distributed_ban_store: None,
+            detection_exclusions: None,
+            scan_fn: guard_core_engine::detection_exclusions::scan_request,
+            stage: None,
         }
     }
 
@@ -384,8 +418,10 @@ impl GuardTransform {
     /// `403 Forbidden` (`IP address banned`), before rate limiting. The
     /// stage's violation counters feed the auto-ban engine exactly like the
     /// reference pipeline's suspicious-activity stage: every detected
-    /// threat counts its categories per client IP (exempt and whitelisted
-    /// IPs never count - the `exempt_ips` contract), and a crossed
+    /// threat counts its categories per client IP (whitelisted IPs never
+    /// count - the reference suspicious-activity stage skips a whitelisted
+    /// IP only; exempt IPs DO count, which makes a crossed threshold ban
+    /// even an exempt attacker), and a crossed
     /// `threat_ban_config` entry (or the flat `auto_ban_threshold`)
     /// bans on the spot, answering `403 Forbidden` (`IP has been banned`).
     /// The `config.enable_ip_banning` switch gates all of it; with it off
@@ -425,6 +461,157 @@ impl GuardTransform {
         self
     }
 
+    /// Install the per-route rate-limit tier resolver:
+    /// `path -> Option<RouteRateLimits>` (the tower counterpart of the
+    /// reference's `request.state.route_config`). A
+    /// [`RouteRateLimits`] request extension, when a stack provides one,
+    /// wins over the resolver. The tier's `rate_limit`/`rate_limit_window`
+    /// (and its per-country `geo_rate_limits`, resolved through
+    /// [`GuardTransform::with_geo_handler`]) apply on top of the global tier;
+    /// the first tier that crosses decides, answering the same
+    /// `429 + Retry-After` shape.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use actix_guard_rs::{GuardTransform, RouteRateLimits, default_config};
+    ///
+    /// let transform =
+    ///     GuardTransform::new(default_config()).with_route_tiers(std::sync::Arc::new(|path| {
+    ///         if path.starts_with("/login") {
+    ///             Some(RouteRateLimits::new(Some(5), None, None).expect("valid tiers"))
+    ///         } else {
+    ///             None
+    ///         }
+    ///     }));
+    /// # let _ = transform;
+    /// ```
+    #[must_use]
+    pub fn with_route_tiers(mut self, resolver: RouteRateResolver) -> Self {
+        self.route_tiers = Some(resolver);
+        self
+    }
+
+    /// Install the geolocation seam the geo rate-limit tier resolves
+    /// through (`geo_handler.get_country(ip)`; the MMDB reading is the
+    /// host's work, [`GeoIpHandler`] is the engine trait). Without a
+    /// handler the geo tier never applies, exactly the reference's
+    /// `if not geo_handler: return None`.
+    #[must_use]
+    pub fn with_geo_handler(mut self, handler: Arc<dyn GeoIpHandler>) -> Self {
+        self.geo_handler = Some(handler);
+        self
+    }
+
+    /// Install the [`SecurityEventBus`] the stage's security events
+    /// dispatch through (`penetration_attempt`, `rate_limited`,
+    /// `ip_banned`, with the reference fields and metadata). Handlers
+    /// receive every event and own the transport.
+    #[must_use]
+    pub fn with_event_bus(mut self, bus: Arc<SecurityEventBus>) -> Self {
+        self.events = Some(bus);
+        self
+    }
+
+    /// Install the observability knobs ([`ObservabilityConfig`]): the
+    /// `log_suspicious_level` (`None` composes no suspicious line), the
+    /// `muted_check_logs` set, and the `log_sensitive_headers` /
+    /// `log_sensitive_params` / `log_sensitive_body_fields` redaction sets
+    /// (merged over the engine defaults) that the suspicious log lines,
+    /// the event endpoint/user-agent fields, and the `on_block` payload
+    /// redact through.
+    #[must_use]
+    pub fn with_observability(mut self, observability: ObservabilityConfig) -> Self {
+        self.observability = Some(observability);
+        self
+    }
+
+    /// Install the reference `on_block` callback: fired exactly once per
+    /// blocked request (and once per passive-flagged detection, with
+    /// `status_code = None`) with the reference [`BlockPayload`] keys
+    /// (check name, reason, trigger, redacted path, method, status).
+    /// Matching the engine stage's contract, the hook receives redacted
+    /// payloads only when an [`ObservabilityConfig`] is installed.
+    #[must_use]
+    pub fn with_on_block(mut self, hook: OnBlockHook) -> Self {
+        self.on_block = Some(hook);
+        self
+    }
+
+    /// Install the reference `custom_error_responses` map: status code to
+    /// message body, overriding the family default for that status on
+    /// every block answer the guard renders (`429`, both `403` banned
+    /// shapes, the `503` Redis-unavailable shape, and the `400`
+    /// detection block).
+    #[must_use]
+    pub fn with_custom_error_responses(
+        mut self,
+        custom_error_responses: CustomErrorResponses,
+    ) -> Self {
+        self.custom_error_responses = custom_error_responses;
+        self
+    }
+
+    /// Set the reference `passive_mode` (default `false`): log-only
+    /// security. Sliding windows and violation counters still record, the
+    /// log lines and events still fire, but no `400`/`403`/`429` is ever
+    /// rendered and the auto-ban feeds are suppressed - the reference's
+    /// passive paths.
+    #[must_use]
+    pub fn with_passive_mode(mut self, passive_mode: bool) -> Self {
+        self.passive_mode = passive_mode;
+        self
+    }
+
+    /// Run the limiter and ban engine over a distributed store (the
+    /// reference `enable_redis && redis_handler` conjunction): a
+    /// [`SlidingWindowStore`] plus the reference `redis_prefix` and
+    /// `redis_fail_open` knobs. `redis_fail_open = false` (the default)
+    /// answers the fail-closed `503 "Redis rate limiting unavailable"` on
+    /// a backend error; `true` degrades to the in-memory window. Install
+    /// a [`BanStore`] alongside with
+    /// [`GuardTransform::with_distributed_ban_store`]. The traits are
+    /// engine-side and client-free; `guard-core-rs`' `redis` feature
+    /// ships a ready `RedisStore` backend.
+    #[must_use]
+    pub fn with_distributed_store(
+        mut self,
+        window_store: Arc<dyn SlidingWindowStore>,
+        redis_prefix: &str,
+        redis_fail_open: bool,
+    ) -> Self {
+        self.distributed = Some((window_store, redis_prefix.to_owned(), redis_fail_open));
+        self
+    }
+
+    /// Attach the distributed ban store the ban engine shares (the
+    /// reference `{prefix}banned_ips:{ip}` namespace). Only meaningful
+    /// together with [`GuardTransform::with_distributed_store`].
+    #[must_use]
+    pub fn with_distributed_ban_store(mut self, ban_store: Arc<dyn BanStore>) -> Self {
+        self.distributed_ban_store = Some(ban_store);
+        self
+    }
+
+    /// Install the global detection-exclusion config
+    /// ([`DetectionExclusionConfig`], the reference `SecurityConfig`
+    /// fields of the same names): `excluded_detection_headers` (merged
+    /// with the engine defaults), `excluded_detection_params`,
+    /// `excluded_detection_body_fields`, `enabled_detection_categories`,
+    /// and `detection_scan_body`. A
+    /// [`RouteDetectionExclusions`] request extension (the per-route
+    /// decorator surface) resolves on top of it per request: a non-`None`
+    /// route value replaces the global set for that surface (the header
+    /// set always merges).
+    #[must_use]
+    pub fn with_detection_exclusions(
+        mut self,
+        detection_exclusions: DetectionExclusionConfig,
+    ) -> Self {
+        self.detection_exclusions = Some(detection_exclusions);
+        self
+    }
+
     pub(crate) const fn config(&self) -> &DetectConfig {
         &self.config
     }
@@ -437,23 +624,126 @@ impl GuardTransform {
         self.ip_gate.as_ref()
     }
 
-    pub(crate) fn rate_limiter(&self) -> Option<&RateLimiter> {
-        self.rate_limiter.as_deref()
+    pub(crate) const fn detection_exclusions(&self) -> Option<&DetectionExclusionConfig> {
+        self.detection_exclusions.as_ref()
     }
 
-    pub(crate) fn ban_state(&self) -> Option<&BanState> {
-        self.ban_state.as_deref()
+    pub(crate) const fn observability(&self) -> Option<&ObservabilityConfig> {
+        self.observability.as_ref()
     }
 
-    pub(crate) const fn detect_fn(&self) -> DetectFn {
-        self.detect_fn
+    pub(crate) const fn on_block(&self) -> Option<&OnBlockHook> {
+        self.on_block.as_ref()
     }
 
-    /// Substitute the detector. Test-only: exercises the fail-secure path.
+    pub(crate) const fn custom_error_responses(&self) -> &CustomErrorResponses {
+        &self.custom_error_responses
+    }
+
+    /// The installed engine stage (set by `Transform::new_transform`);
+    /// every stateful decision and emission goes through it.
+    pub(crate) fn stage(&self) -> Option<&RateLimitStage> {
+        self.stage.as_deref()
+    }
+
+    /// Build the engine stage from the configured handles and seams.
+    /// Every injected config is already validated (the `with_*` builders
+    /// take pre-validated engine objects), so the stage build cannot
+    /// fail; a panic here is a construction bug, not a runtime path.
+    pub(crate) fn build_stage(&self) -> RateLimitStage {
+        let rate_limit = self.rate_limiter.as_deref().map_or(
+            RateLimitConfig {
+                enable_rate_limiting: false,
+                ..RateLimitConfig::default()
+            },
+            |limiter| limiter.config().clone(),
+        );
+        let ip_ban = self.ban_state.as_deref().map_or(
+            IpBanConfig {
+                enable_ip_banning: false,
+                ..IpBanConfig::default()
+            },
+            |state| state.config.clone(),
+        );
+        let mut builder = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit,
+            ip_ban,
+            passive_mode: self.passive_mode,
+            custom_error_responses: self.custom_error_responses.clone(),
+        });
+        if let Some(limiter) = &self.rate_limiter {
+            builder = builder.limiter(limiter.as_ref().clone());
+        }
+        if let Some(state) = &self.ban_state {
+            builder = builder.ban_manager(state.manager.clone(), state.counters.clone());
+        }
+        if let Some(resolver) = &self.route_tiers {
+            {
+                let resolver = Arc::clone(resolver);
+                builder = builder.route_resolver(move |path| resolver(path));
+            }
+        }
+        if let Some(handler) = &self.geo_handler {
+            builder = builder.geo_handler(Arc::clone(handler));
+        }
+        if let Some(bus) = &self.events {
+            builder = builder.events(Arc::clone(bus));
+        }
+        if let Some(observability) = &self.observability {
+            builder = builder.observability(observability.clone());
+        }
+        if let Some(hook) = &self.on_block {
+            builder = builder.on_block(Arc::clone(hook));
+        }
+        if let Some((store, prefix, fail_open)) = &self.distributed {
+            builder = builder.distributed_store(Arc::clone(store), prefix, *fail_open);
+        }
+        if let Some(ban_store) = &self.distributed_ban_store {
+            builder = builder.distributed_ban_store(Arc::clone(ban_store));
+        }
+        builder
+            .build()
+            .expect("guard configs are validated by their constructors")
+    }
+
     #[cfg(test)]
-    pub(crate) fn with_detect_fn(mut self, detect_fn: DetectFn) -> Self {
-        self.detect_fn = detect_fn;
+    pub(crate) fn with_scan_fn(mut self, scan_fn: ScanFn) -> Self {
+        self.scan_fn = scan_fn;
         self
+    }
+
+    pub(crate) const fn scan_fn(&self) -> ScanFn {
+        self.scan_fn
+    }
+}
+
+/// The multi-surface scan entry point stored in the layer.
+///
+/// Indirection exists so unit tests can substitute a panicking scan and
+/// exercise the fail-secure path; production builds always store
+/// [`guard_core_engine::detection_exclusions::scan_request`].
+pub(crate) type ScanFn = fn(
+    &guard_core_engine::detection_exclusions::RequestSurfaces<'_>,
+    &guard_core_engine::detection_exclusions::ResolvedExclusions,
+    &DetectConfig,
+) -> guard_core_engine::detection_exclusions::RequestScanVerdict;
+
+/// Manual [`core::fmt::Debug`]: the hook, resolver, and store seams are
+/// trait objects without `Debug`, so the transform prints its configuration
+/// shape and stops (`finish_non_exhaustive`).
+impl core::fmt::Debug for GuardTransform {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GuardTransform")
+            .field("config", &self.config)
+            .field("body_cap", &self.body_cap)
+            .field("ip_gate", &self.ip_gate)
+            .field("rate_limiter", &self.rate_limiter)
+            .field("ban_state", &self.ban_state)
+            .field("custom_error_responses", &self.custom_error_responses)
+            .field("passive_mode", &self.passive_mode)
+            .field("detection_exclusions", &self.detection_exclusions)
+            .field("stage", &self.stage)
+            .finish_non_exhaustive()
     }
 }
 
@@ -470,7 +760,11 @@ where
     type Future = std::future::Ready<Result<Self::Transform, Self::InitError>>;
 
     fn new_transform(&self, service: S) -> Self::Future {
-        std::future::ready(Ok(GuardService::new(service, self.clone())))
+        let mut transform = self.clone();
+        if transform.stage.is_none() {
+            transform.stage = Some(Arc::new(self.build_stage()));
+        }
+        std::future::ready(Ok(GuardService::new(service, transform)))
     }
 }
 

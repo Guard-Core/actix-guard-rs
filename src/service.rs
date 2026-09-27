@@ -8,13 +8,14 @@ use actix_web::http::header;
 use actix_web::{Error, HttpMessage, HttpRequest};
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
-use guard_core_engine::body_scan::extract_body_scan_values;
-use guard_core_engine::detect::Threat;
-use guard_core_engine::ip_ban::RATE_LIMIT_CATEGORY;
+use guard_core_engine::detection_exclusions::{
+    RequestSurfaces, RouteDetectionExclusions, resolve as resolve_exclusions,
+};
 use guard_core_engine::ip_gate::IpGateDecision;
 use guard_core_engine::ip_gate::IpGateVerdict;
+use guard_core_rs::responses::{build_block_payload, fire_block_hook, resolve_error_body};
+use guard_core_rs::tower::{RequestObservation, RouteRateLimits};
 use std::future::{Future, poll_fn};
-use std::net::IpAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -97,7 +98,7 @@ pub(crate) enum ScanOutcome {
     /// At least one view was flagged as a threat; the detection categories
     /// of the first flagged view, deduplicated and sorted (the auto-ban
     /// engine counts them per client IP).
-    Threat(Vec<String>),
+    Threat(guard_core_engine::detection_exclusions::RequestScanVerdict),
     /// The engine panicked; fail secure.
     Failed,
 }
@@ -128,38 +129,124 @@ where
                 return Ok(response);
             }
 
-            // The stateful stage (dynamic bans, then rate limiting) runs on
-            // every attributed, non-exempt request before a body buffer is
-            // spent on it.
-            if let Some(response) = enforce_state_stage(&request, &transform) {
-                return Ok(response);
-            }
-
             let buffered = match buffer_body(payload, transform.body_cap()).await {
                 Ok(buffered) => buffered,
                 Err(BufferFailure::TooLarge) => return Ok(response::oversize(request)),
                 Err(BufferFailure::Read) => return Ok(response::failure(request)),
             };
-            match scan_request(&request, buffered.as_ref(), &transform) {
-                ScanOutcome::Clean => {
-                    // actix Web consumes the payload while buffering, so the
-                    // request the next service sees is rebuilt around the
-                    // buffered bytes (see the crate docs on request rebuilding).
-                    let rebuilt = ServiceRequest::from_parts(
-                        request,
-                        Payload::from(buffered.unwrap_or_default()),
-                    );
-                    next.call(rebuilt)
-                        .await
-                        .map(ServiceResponse::map_into_boxed_body)
-                }
-                ScanOutcome::Threat(categories) => {
-                    Ok(detect_block(&request, &transform, &categories))
-                }
-                ScanOutcome::Failed => Ok(response::failure(request)),
+            let verdict = match scan_request(&request, buffered.as_ref(), &transform) {
+                ScanOutcome::Clean => None,
+                ScanOutcome::Failed => return Ok(response::failure(request)),
+                ScanOutcome::Threat(verdict) => Some(verdict),
+            };
+
+            // One engine-stage pass decides for every request: bans first
+            // (403 `IP address banned`), then the rate-limit tiers
+            // (429 + `Retry-After`), then the detection feed (the auto-ban
+            // engine may answer `403 IP has been banned` on this very
+            // request) - the reference pipeline order: `ip_security` (ban
+            // check), `rate_limit`, `suspicious_activity`.
+            let stage = transform
+                .stage()
+                .expect("the stage is built by Transform::new_transform");
+            let finding = verdict
+                .as_ref()
+                .map(|verdict| guard_core_rs::tower::ThreatFinding {
+                    is_threat: true,
+                    categories: verdict.categories.clone(),
+                    trigger_info: verdict.reason.clone(),
+                });
+            let observation = request_observation(&request);
+            let decision = stage.decide_for_path_observed(
+                client_ip(&request),
+                Some(request.path()),
+                request.extensions().get::<RouteRateLimits>(),
+                request.extensions().get::<IpGateDecision>().copied(),
+                finding.as_ref(),
+                Some(&observation),
+            );
+            if let Some(blocked) = decision {
+                return Ok(response::stage(request, &blocked));
             }
+            if let (Some(verdict), false) = (&verdict, stage.config().passive_mode) {
+                // Below-threshold detection (or an unattributed request):
+                // the plain family block shape. Under passive mode the
+                // detection was observed and counted by the stage and the
+                // request forwards (the reference's passive path renders
+                // no block).
+                return Ok(detection_block(&request, &transform, verdict));
+            }
+            // actix Web consumes the payload while buffering, so the
+            // request the next service sees is rebuilt around the
+            // buffered bytes (see the crate docs on request rebuilding).
+            let rebuilt =
+                ServiceRequest::from_parts(request, Payload::from(buffered.unwrap_or_default()));
+            next.call(rebuilt)
+                .await
+                .map(ServiceResponse::map_into_boxed_body)
         })
     }
+}
+
+/// The request's attributed client IP, when the peer address exists.
+fn client_ip(request: &HttpRequest) -> Option<std::net::IpAddr> {
+    request.peer_addr().map(|peer| peer.ip())
+}
+
+/// The request pieces the stage's event and log emissions read.
+fn request_observation(request: &HttpRequest) -> RequestObservation {
+    let mut url = request.path().to_owned();
+    let query = request.query_string();
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(query);
+    }
+    RequestObservation {
+        method: Some(request.method().as_str().to_owned()),
+        url: Some(url),
+        user_agent: request
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    }
+}
+
+/// The plain detection block for a flagged request whose violations did
+/// not cross a ban threshold (or that carried no client IP to attribute):
+/// the family's `400 Bad Request` (`Suspicious activity detected`), with
+/// the `custom_error_responses` body override and the reference `on_block`
+/// payload when the corresponding seams are installed.
+fn detection_block(
+    request: &HttpRequest,
+    transform: &GuardTransform,
+    verdict: &guard_core_engine::detection_exclusions::RequestScanVerdict,
+) -> ServiceResponse {
+    let status = 400;
+    let body = resolve_error_body(
+        transform.custom_error_responses(),
+        status,
+        response::BLOCKED_MESSAGE,
+    );
+    if let Some(observability) = transform.observability() {
+        let ip = client_ip(request)
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        let observation = request_observation(request);
+        let payload = build_block_payload(
+            "suspicious_activity",
+            &format!("Suspicious activity detected: {ip}"),
+            &verdict.reason,
+            false,
+            &ip,
+            observation.url.as_deref().unwrap_or("/"),
+            observation.method.as_deref().unwrap_or(""),
+            Some(status),
+            &observability.sensitive,
+        );
+        fire_block_hook(transform.on_block(), &payload);
+    }
+    response::blocked_with_body(request.clone(), status, &body)
 }
 
 /// Apply the configured IP gate to the request.
@@ -181,102 +268,6 @@ fn enforce_ip_gate(request: &HttpRequest, transform: &GuardTransform) -> Option<
         }
         IpGateVerdict::Denied(_) => Some(response::forbidden(request.clone())),
     }
-}
-
-/// The client IP, when the request is attributable and not skipped by the
-/// `exempt_ips` contract: the stateful stage's gate.
-///
-/// Unattributed requests cannot be banned, rate limited, or counted (the
-/// stage cannot tell who to hold responsible); whitelisted and exempt IPs
-/// skip exactly what the reference skips for a whitelist match. Detection
-/// applies to both, always.
-fn attributed_and_counting(request: &HttpRequest) -> Option<IpAddr> {
-    let peer = request.peer_addr()?;
-    let decision = request
-        .extensions()
-        .get::<IpGateDecision>()
-        .copied()
-        .unwrap_or_default();
-    if decision.is_whitelisted || decision.is_exempt {
-        return None;
-    }
-    Some(peer.ip())
-}
-
-/// The stateful stage: dynamic bans, then rate limiting, in the reference
-/// pipeline's order (an IP ban check precedes the rate limiter).
-///
-/// Returns the block response when the stage denies the request:
-/// `403 Forbidden` (`IP address banned`) for a live ban,
-/// `429 Too Many Requests` with `Retry-After: <window>` for a crossing.
-fn enforce_state_stage(
-    request: &HttpRequest,
-    transform: &GuardTransform,
-) -> Option<ServiceResponse> {
-    let ip = attributed_and_counting(request)?;
-
-    // Ban check first: a banned IP is denied before its rate window is
-    // touched, so banned traffic neither consumes budget nor counts
-    // violations (the request never reaches the limiter).
-    if let Some(ban) = transform.ban_state()
-        && ban.config.enable_ip_banning
-        && ban.manager.is_banned(ip)
-    {
-        return Some(response::banned_ip(request.clone()));
-    }
-
-    let limiter = transform.rate_limiter()?;
-    let decision = limiter.check(ip, None);
-    if decision.allowed {
-        return None;
-    }
-    // Rate-limit autoban: every active crossing counts one `rate_limit`
-    // violation toward the auto-ban engine (the reference's
-    // `_record_rate_limit_autoban`). The response stays 429; the ban takes
-    // effect on the next request, which the ban stage answers with 403.
-    if limiter.config().enable_rate_limit_auto_ban
-        && let Some(ban) = transform.ban_state()
-    {
-        ban.register_violations(ip, &[RATE_LIMIT_CATEGORY], "rate_limit_exceeded");
-    }
-    Some(response::rate_limited(
-        request.clone(),
-        decision.retry_after(),
-    ))
-}
-
-/// The detection block for one flagged request, with the auto-ban engine
-/// attached: the flagged view's categories count as violations for the
-/// client IP, and a crossed threshold bans on the spot (the reference
-/// pipeline's suspicious-activity stage). Banning configured and fired
-/// answers `IP has been banned`; everything else keeps the family's
-/// `Suspicious activity detected` block shape.
-fn detect_block(
-    request: &HttpRequest,
-    transform: &GuardTransform,
-    categories: &[String],
-) -> ServiceResponse {
-    // Counting is attribute-gated only: the engine's resolution refuses to
-    // ban while the config's enable_ip_banning is off, and the violations
-    // still count (enabling banning later starts from observed history).
-    if let (Some(ban), Some(ip)) = (transform.ban_state(), attributed_and_counting(request)) {
-        let category_refs: Vec<&str> = categories.iter().map(String::as_str).collect();
-        if ban
-            .register_violations(ip, &category_refs, "penetration_attempt")
-            .is_some()
-        {
-            return response::activity_banned(request.clone());
-        }
-    }
-    response::blocked(request.clone())
-}
-
-/// Deduplicate and sort the flagged view's categories: the deterministic
-/// order the auto-ban engine resolves thresholds in (the Go port sorts too).
-fn sort_categories(mut categories: Vec<String>) -> Vec<String> {
-    categories.sort_unstable();
-    categories.dedup();
-    categories
 }
 
 /// Buffer a request body up to `cap` bytes.
@@ -311,118 +302,119 @@ fn scan_request(
     transform: &GuardTransform,
 ) -> ScanOutcome {
     match catch_unwind(AssertUnwindSafe(|| scan_views(request, body, transform))) {
-        Ok(ScanOutcome::Threat(categories)) => ScanOutcome::Threat(sort_categories(categories)),
         Ok(outcome) => outcome,
         Err(_) => ScanOutcome::Failed,
     }
 }
 
-/// One engine call per view, in the documented order: path, query, headers,
-/// body. The first view the engine flags wins, and its categories are the
-/// violation categories the auto-ban engine counts.
+/// One multi-surface engine pass over the request, in the reference scan
+/// order: URL path, query params, headers, body. The per-route
+/// detection-exclusion surface ([`RouteDetectionExclusions`] request
+/// extension resolving over the global config) merges and lowercases
+/// through the engine's `resolve`, and [`scan_request`] (the engine's)
+/// applies the reference semantics exactly: excluded query params and body
+/// fields are skipped, excluded headers scan with their known
+/// false-positive categories suppressed (address-carrying proxy headers
+/// lose only `ssrf`, and only for address-chain values), the
+/// enabled-categories set filters per value (a threat whose categories are
+/// all filtered out ends the scan clean - terminal, not a reason to keep
+/// scanning), and `detection_scan_body = false` skips the body surface
+/// entirely.
+///
+/// The adapter-level pre-filter (`EXCLUDED_HEADERS`, every `sec-*` name)
+/// keeps framework noise headers out of the surfaces before the engine
+/// sees them. A semantic-only threat carries no category and contributes
+/// nothing here, exactly like the reference's `category == ""` guard.
 fn scan_views(
     request: &HttpRequest,
     body: Option<&Bytes>,
     transform: &GuardTransform,
 ) -> ScanOutcome {
+    let resolved = resolve_exclusions(
+        transform.detection_exclusions(),
+        request.extensions().get::<RouteDetectionExclusions>(),
+    );
+
     let path = request.path();
-    if path != "/"
-        && let Some(categories) = categories_for(transform, path, "url_path")
-    {
-        return ScanOutcome::Threat(categories);
-    }
+    let url_path = if path == "/" { None } else { Some(path) };
 
-    let query = request.query_string();
-    if !query.is_empty()
-        && let Some(categories) = categories_for(transform, query, "query_param")
-    {
-        return ScanOutcome::Threat(categories);
-    }
+    // Query parameter pairs, `parse_qsl`-decoded (the reference reads the
+    // decoded values, so exclusions and detection see what the handler
+    // sees). Per pair, so excluded names are skippable.
+    let query_params: Vec<(String, String)> = request
+        .query_string()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) => (decode_query_component(name), decode_query_component(value)),
+            None => (decode_query_component(pair), String::new()),
+        })
+        .collect();
 
-    for (name, value) in request.headers() {
-        if is_excluded_header(name.as_str()) {
-            continue;
-        }
-        // Opaque (non-ASCII) header values cannot be represented as `&str`.
-        // They are skipped rather than guessed at, mirroring the string-typed
-        // header maps the TypeScript adapters hand to the engine.
-        let Ok(value) = value.to_str() else {
-            continue;
-        };
-        if let Some(categories) = categories_for(transform, value, "header") {
-            return ScanOutcome::Threat(categories);
-        }
-    }
+    let headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .filter(|(name, _)| !is_excluded_header(name.as_str()))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
 
-    if let Some(bytes) = body {
-        // Content-type routing (urlencoded fields, multipart parts, JSON
-        // walks, blob fallback) happens in the engine; every extracted value
-        // is scanned with its reference context instead of the lossy
-        // whole-body blob.
-        let content_type = request
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok());
-        if let Some(categories) = body_categories(transform, content_type, bytes) {
-            return ScanOutcome::Threat(categories);
-        }
-    }
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let raw_body = body
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
 
-    ScanOutcome::Clean
-}
-
-/// Scan the buffered request body through the engine's body-value extraction
-/// (`request_body` view).
-///
-/// Every extracted value goes through the normal detect path with the context
-/// label the reference engine scans it under (`request_body:form_field`,
-/// `request_body:multipart_field`, `:embedded_json` leaves, ...); the first
-/// threat wins. A value with a forced category (a JSON mongo operator key the
-/// reference reports straight from the JSON walk) is a threat outright. An
-/// empty (or whitespace-only) body is not scanned, mirroring the previous
-/// behavior.
-fn body_categories(
-    transform: &GuardTransform,
-    content_type: Option<&str>,
-    bytes: &[u8],
-) -> Option<Vec<String>> {
-    let text = String::from_utf8_lossy(bytes);
-    if text.trim().is_empty() {
-        return None;
+    let surfaces = RequestSurfaces {
+        url_path,
+        query_params: &query_params,
+        headers: &headers,
+        content_type,
+        raw_body: &raw_body,
+    };
+    let verdict = (transform.scan_fn())(&surfaces, &resolved, transform.config());
+    if verdict.is_threat {
+        ScanOutcome::Threat(verdict)
+    } else {
+        ScanOutcome::Clean
     }
-    for value in extract_body_scan_values(&text, content_type.unwrap_or(""), transform.config()) {
-        if let Some(forced) = value.forced_category {
-            return Some(vec![forced.to_owned()]);
-        }
-        if let Some(categories) = categories_for(transform, &value.content, &value.context) {
-            return Some(categories);
-        }
-    }
-    None
-}
-
-/// One engine call: the flagged view's threat categories, or `None` when the
-/// engine clears the content. Regex threats carry the pattern table's
-/// category; semantic threats carry their attack type.
-fn categories_for(transform: &GuardTransform, content: &str, view: &str) -> Option<Vec<String>> {
-    let verdict = (transform.detect_fn())(content, view, transform.config());
-    if !verdict.is_threat {
-        return None;
-    }
-    Some(
-        verdict
-            .threats
-            .iter()
-            .map(|threat| match threat {
-                Threat::Regex(regex) => regex.category.clone(),
-                Threat::Semantic(semantic) => semantic.attack_type.clone(),
-            })
-            .collect(),
-    )
 }
 
 fn is_excluded_header(name: &str) -> bool {
     name.starts_with("sec-") || EXCLUDED_HEADERS.contains(&name)
+}
+
+/// `urllib.parse.unquote_plus` for one query component: `%XX` runs and
+/// `+` (form-encoding's space) decode into the value the reference's
+/// `parse_qsl` hands the engine. Malformed escapes stay literal.
+fn decode_query_component(component: &str) -> String {
+    let plus_decoded = component.replace('+', " ");
+    let bytes = plus_decoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
+                16,
+            )
+        {
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -434,9 +426,13 @@ mod tests {
     use actix_web::error::PayloadError;
     use actix_web::test::TestRequest;
     use actix_web::{Error, HttpResponse};
-    use guard_core_engine::detect::{DetectConfig, DetectVerdict};
+    use guard_core_engine::detect::DetectConfig;
 
-    fn panicking_detect(_content: &str, _context: &str, _config: &DetectConfig) -> DetectVerdict {
+    fn panicking_scan(
+        _surfaces: &guard_core_engine::detection_exclusions::RequestSurfaces<'_>,
+        _exclusions: &guard_core_engine::detection_exclusions::ResolvedExclusions,
+        _config: &DetectConfig,
+    ) -> guard_core_engine::detection_exclusions::RequestScanVerdict {
         panic!("engine exploded");
     }
 
@@ -455,7 +451,7 @@ mod tests {
     #[actix_web::test]
     async fn engine_panic_is_recovered_as_a_500() {
         let guard =
-            guarded(GuardTransform::new(default_config()).with_detect_fn(panicking_detect)).await;
+            guarded(GuardTransform::new(default_config()).with_scan_fn(panicking_scan)).await;
         let request = TestRequest::post()
             .uri("/hello")
             .set_payload("ping")
@@ -472,9 +468,13 @@ mod tests {
         let request = TestRequest::default()
             .uri("/files/../../etc/passwd")
             .to_http_request();
-        assert_eq!(
-            scan_request(&request, None, &transform),
-            ScanOutcome::Threat(vec!["dir_traversal".to_owned()]),
+        assert!(
+            matches!(
+                scan_request(&request, None, &transform),
+                ScanOutcome::Threat(ref verdict)
+                    if verdict.is_threat
+                        && verdict.categories == vec!["dir_traversal".to_owned()]
+            ),
             "traversal path should be flagged with its category"
         );
     }
@@ -493,7 +493,14 @@ mod tests {
             Some(&Bytes::from_static(b"SELECT * FROM users")),
             &transform,
         );
-        assert_eq!(outcome, ScanOutcome::Threat(vec!["sqli".to_owned()]));
+        assert!(
+            matches!(
+                outcome,
+                ScanOutcome::Threat(ref verdict)
+                    if verdict.is_threat && verdict.categories == vec!["sqli".to_owned()]
+            ),
+            "the body blob should flag sqli once"
+        );
     }
 
     #[actix_web::test]
@@ -885,6 +892,7 @@ mod tests {
 
     // --- the stateful stage: rate limiting, bans, auto-ban ---
 
+    use crate::DetectionExclusionConfig;
     use crate::{
         ACTIVITY_BANNED_MESSAGE, BANNED_MESSAGE, IpBanConfig, IpBanManager, RATE_LIMITED_MESSAGE,
         RateLimitConfig, RateLimiter, ThreatBanEntry,
@@ -892,8 +900,8 @@ mod tests {
     use actix_web::http::StatusCode;
     use actix_web::http::header::RETRY_AFTER;
     use guard_core_engine::ip_ban::Clock;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// The empty `threat_ban_config`, typed so the `new` calls stay inferable.
     fn no_entries() -> Vec<(String, ThreatBanEntry)> {
@@ -1140,18 +1148,21 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn exempt_ip_never_counts_detection_violations() {
-        // Checklist: the exempt flag makes violation counting observable -
-        // an exempt attacker can never be auto-banned.
+    async fn exempt_ip_violations_still_count_toward_the_ban() {
+        // Checklist: the exemption skips rate limiting and the ban *check*
+        // skip state never shields counting - the reference's
+        // suspicious-activity stage skips a whitelisted IP only, so an
+        // exempt attacker's detections still feed the auto-ban engine and
+        // a crossed threshold bans on the spot.
         let gate = crate::IpGateConfig::new(NIL, NIL, ["198.51.100.7"]).expect("valid lists");
         let config = IpBanConfig::new(
             true,
-            1,
+            100,
             3600,
             [(
                 "dir_traversal",
                 ThreatBanEntry {
-                    threshold: 1,
+                    threshold: 2,
                     duration: 60,
                 },
             )],
@@ -1160,15 +1171,22 @@ mod tests {
         let transform = GuardTransform::new(default_config())
             .with_ip_gate(gate)
             .with_ip_banning(IpBanManager::new(), config);
-        for _ in 0..3 {
-            let (status, body, _) =
-                full_status(transform.clone(), attack_request("198.51.100.7")).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(
-                body, BLOCKED_MESSAGE,
-                "exempt violations are not counted, so no ban can fire"
-            );
-        }
+        let (status, body, _) =
+            full_status(transform.clone(), attack_request("198.51.100.7")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, BLOCKED_MESSAGE, "violation 1: the plain block shape");
+        let (status, body, _) =
+            full_status(transform.clone(), attack_request("198.51.100.7")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body, ACTIVITY_BANNED_MESSAGE,
+            "exempt violations count: the crossed threshold bans"
+        );
+        // From then on the ban stage answers everything.
+        let (status, body, _) =
+            full_status(transform.clone(), benign_request("198.51.100.7")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, crate::BANNED_MESSAGE);
     }
 
     #[actix_web::test]
@@ -1256,5 +1274,483 @@ mod tests {
         fn call(&self, request: ServiceRequest) -> Self::Future {
             std::future::ready(Ok(request.into_response(HttpResponse::Ok().finish())))
         }
+    }
+    // ---- the wave surfaces, end to end through the public API ----
+
+    /// A static geolocation: every IP maps to `DE`.
+    struct StaticGeo;
+
+    impl guard_core_engine::geo::GeoIpHandler for StaticGeo {
+        fn get_country(&self, ip: IpAddr) -> Option<String> {
+            let _ = ip;
+            Some("DE".to_owned())
+        }
+    }
+
+    /// A fixed test peer address: the requests are attributable.
+    fn peer() -> std::net::SocketAddr {
+        std::net::SocketAddr::new(IpAddr::from_str("192.0.2.200").unwrap(), 45_000)
+    }
+
+    /// Insert a request extension (the per-route surface idiom).
+    fn with_ext<T: Send + Sync + 'static>(request: ServiceRequest, ext: T) -> ServiceRequest {
+        request.extensions_mut().insert(ext);
+        request
+    }
+
+    async fn status_body(
+        transform: GuardTransform,
+        request: ServiceRequest,
+    ) -> (StatusCode, String) {
+        let (status, body, _) = full_status(transform, request).await;
+        (status, body)
+    }
+
+    #[actix_web::test]
+    async fn route_tier_resolver_limits_its_paths_only() {
+        let tiers = Arc::new(|path: &str| {
+            if path.starts_with("/login") {
+                Some(RouteRateLimits::new(Some(1), None, None).expect("valid tiers"))
+            } else {
+                None
+            }
+        });
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter(1000, false))
+            .with_route_tiers(tiers);
+        let request = TestRequest::get()
+            .uri("/login")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let request = TestRequest::get()
+            .uri("/login")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, body, retry_after) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, RATE_LIMITED_MESSAGE);
+        assert_eq!(retry_after.as_deref(), Some("60"));
+        let request = TestRequest::get()
+            .uri("/other")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK, "other paths keep the global tier");
+    }
+
+    #[actix_web::test]
+    async fn route_rate_limits_extension_wins_over_the_resolver() {
+        let tiers = Arc::new(|_path: &str| {
+            Some(RouteRateLimits::new(Some(100), None, None).expect("valid tiers"))
+        });
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter(1000, false))
+            .with_route_tiers(tiers);
+        let build = || {
+            let request = TestRequest::get()
+                .uri("/tight")
+                .peer_addr(peer())
+                .to_srv_request();
+            with_ext(
+                request,
+                RouteRateLimits::new(Some(1), None, None).expect("valid tiers"),
+            )
+        };
+        let (status, _, _) = full_status(transform.clone(), build()).await;
+        assert_eq!(status, StatusCode::OK, "the extension tier allows one");
+        let (status, _, _) = full_status(transform.clone(), build()).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the extension tier wins over the resolver"
+        );
+    }
+
+    #[actix_web::test]
+    async fn geo_tier_limits_the_resolved_country() {
+        let mut geo = std::collections::HashMap::new();
+        geo.insert(
+            "DE".to_owned(),
+            guard_core_rs::tower::RateLimitEntry::new(1, 60).expect("valid entry"),
+        );
+        let tiers = Arc::new(move |_path: &str| {
+            Some(RouteRateLimits::new(None, None, Some(geo.clone())).expect("valid tiers"))
+        });
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter(1000, false))
+            .with_route_tiers(tiers)
+            .with_geo_handler(Arc::new(StaticGeo));
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the DE tier crossed");
+    }
+
+    #[actix_web::test]
+    async fn geo_tier_never_applies_without_a_handler() {
+        let mut geo = std::collections::HashMap::new();
+        geo.insert(
+            "DE".to_owned(),
+            guard_core_rs::tower::RateLimitEntry::new(1, 60).expect("valid entry"),
+        );
+        let tiers = Arc::new(move |_path: &str| {
+            Some(RouteRateLimits::new(None, None, Some(geo.clone())).expect("valid tiers"))
+        });
+        let transform = GuardTransform::new(default_config()).with_route_tiers(tiers);
+        for _ in 0..5 {
+            let request = TestRequest::get()
+                .uri("/hello")
+                .peer_addr(peer())
+                .to_srv_request();
+            let (status, _, _) = full_status(transform.clone(), request).await;
+            assert_eq!(status, StatusCode::OK, "no handler: the geo tier is inert");
+        }
+    }
+
+    #[actix_web::test]
+    async fn excluded_detection_params_pass_and_other_params_scan() {
+        let exclusions = DetectionExclusionConfig {
+            excluded_detection_params: vec!["q".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let transform = GuardTransform::new(default_config()).with_detection_exclusions(exclusions);
+        let request = TestRequest::get()
+            .uri("/search?q=1+OR+1%3D1")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _) = status_body(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK, "the excluded param is not scanned");
+        let request = TestRequest::get()
+            .uri("/search?page=1+OR+1%3D1")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _) = status_body(transform.clone(), request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-excluded param still scans"
+        );
+    }
+
+    #[actix_web::test]
+    async fn route_detection_exclusions_override_the_global_config_per_request() {
+        let exclusions = DetectionExclusionConfig {
+            excluded_detection_params: vec!["q".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let transform = GuardTransform::new(default_config()).with_detection_exclusions(exclusions);
+        let route = RouteDetectionExclusions {
+            excluded_detection_params: Some(vec![]),
+            ..RouteDetectionExclusions::default()
+        };
+        let request = TestRequest::get()
+            .uri("/search?q=1+OR+1%3D1")
+            .peer_addr(peer())
+            .to_srv_request();
+        let request = with_ext(request, route);
+        let (status, _) = status_body(transform, request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the route re-enables the param surface"
+        );
+    }
+
+    #[actix_web::test]
+    async fn detection_scan_body_false_skips_the_body_surface() {
+        let exclusions = DetectionExclusionConfig {
+            detection_scan_body: Some(false),
+            ..DetectionExclusionConfig::default()
+        };
+        let transform = GuardTransform::new(default_config()).with_detection_exclusions(exclusions);
+        let request = TestRequest::post()
+            .uri("/submit")
+            .set_payload(Bytes::from_static(b"SELECT * FROM users"))
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _) = status_body(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK, "the body does not scan");
+        let request = TestRequest::get()
+            .uri("/files/../../etc/passwd")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _) = status_body(transform, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "the path still scans");
+    }
+
+    #[actix_web::test]
+    async fn route_scan_body_true_reenables_the_body() {
+        let exclusions = DetectionExclusionConfig {
+            detection_scan_body: Some(false),
+            ..DetectionExclusionConfig::default()
+        };
+        let transform = GuardTransform::new(default_config()).with_detection_exclusions(exclusions);
+        let route = RouteDetectionExclusions {
+            detection_scan_body: Some(true),
+            ..RouteDetectionExclusions::default()
+        };
+        let request = TestRequest::post()
+            .uri("/submit")
+            .set_payload(Bytes::from_static(b"SELECT * FROM users"))
+            .peer_addr(peer())
+            .to_srv_request();
+        let request = with_ext(request, route);
+        let (status, _) = status_body(transform, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn excluded_body_fields_resolve_through_the_engine() {
+        let exclusions = DetectionExclusionConfig {
+            excluded_detection_body_fields: vec!["note".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let transform = GuardTransform::new(default_config()).with_detection_exclusions(exclusions);
+        let request = TestRequest::post()
+            .uri("/submit")
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload(Bytes::from_static(b"note=1+OR+1%3D1"))
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _) = status_body(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK, "excluded field skips");
+        let request = TestRequest::post()
+            .uri("/submit")
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload(Bytes::from_static(b"other=1+OR+1%3D1"))
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _) = status_body(transform, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The `on_block` collector: the payloads the guard fired.
+    fn block_collector() -> (
+        Arc<Mutex<Vec<guard_core_rs::responses::BlockPayload>>>,
+        guard_core_rs::responses::OnBlockHook,
+    ) {
+        let payloads: Arc<Mutex<Vec<guard_core_rs::responses::BlockPayload>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&payloads);
+        let hook: guard_core_rs::responses::OnBlockHook =
+            Arc::new(move |payload| sink.lock().expect("payloads").push(payload.clone()));
+        (payloads, hook)
+    }
+
+    #[actix_web::test]
+    async fn on_block_fires_for_the_detection_block_and_custom_body_overrides_it() {
+        let (payloads, hook) = block_collector();
+        let transform = GuardTransform::new(default_config())
+            .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+            .with_on_block(hook)
+            .with_custom_error_responses(
+                [(400u16, "blocked:custom".to_owned())]
+                    .into_iter()
+                    .collect(),
+            );
+        let request = TestRequest::get()
+            .uri("/files/../../etc/passwd")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, body) = status_body(transform, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body, "blocked:custom",
+            "the custom body overrides the default"
+        );
+        let payloads = payloads.lock().expect("payloads");
+        assert_eq!(payloads.len(), 1, "exactly one payload for the block");
+        let payload = &payloads[0];
+        assert_eq!(payload.check_name, "suspicious_activity");
+        assert_eq!(payload.status_code, Some(400));
+        assert_eq!(payload.client_ip, "192.0.2.200");
+        assert!(!payload.passive_mode);
+    }
+
+    #[actix_web::test]
+    async fn custom_error_responses_override_the_throttled_body() {
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter(1, false))
+            .with_custom_error_responses(
+                [(429u16, "slow down:custom".to_owned())]
+                    .into_iter()
+                    .collect(),
+            );
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, body, retry_after) = full_status(transform, request).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, "slow down:custom");
+        assert_eq!(retry_after.as_deref(), Some("60"), "Retry-After survives");
+    }
+
+    #[actix_web::test]
+    async fn passive_mode_records_but_never_blocks() {
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter(1, false))
+            .with_passive_mode(true);
+        let request = TestRequest::get()
+            .uri("/files/../../etc/passwd")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "passive: the detection block is log-only"
+        );
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform, request).await;
+        assert_eq!(status, StatusCode::OK, "passive: no 429 is rendered");
+    }
+
+    #[actix_web::test]
+    async fn event_bus_receives_the_rate_limited_event() {
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let bus = Arc::new(
+            guard_core_rs::events::SecurityEventBus::new(true).on_event(Arc::new(move |event| {
+                sink.lock().expect("events").push(event.clone());
+            })),
+        );
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter(1, false))
+            .with_event_bus(bus);
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform, request).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let events = events.lock().expect("events");
+        assert!(
+            events.iter().any(|event| event.event_type == "rate_limited"
+                && event.action_taken == "request_blocked"
+                && event.handler_name.as_deref() == Some("rate_limit")),
+            "the rate_limited event fired: {events:?}"
+        );
+    }
+
+    /// A distributed store that always fails (the backend is down).
+    struct DownStore;
+
+    impl guard_core_rs::tower::SlidingWindowStore for DownStore {
+        fn record_hit(
+            &self,
+            _key: &str,
+            _now: f64,
+            _window: u64,
+        ) -> Result<u64, guard_core_engine::distributed::StoreError> {
+            Err(guard_core_engine::distributed::StoreError(String::new()))
+        }
+    }
+
+    #[actix_web::test]
+    async fn distributed_store_fail_closed_answers_the_503_shape() {
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter(10, false))
+            .with_distributed_store(
+                Arc::new(DownStore) as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                false,
+            );
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, body, retry_after) = full_status(transform, request).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fail-closed backend error"
+        );
+        assert_eq!(body, "Redis rate limiting unavailable");
+        assert_eq!(retry_after, None);
+    }
+
+    #[actix_web::test]
+    async fn distributed_store_fail_open_degrades_to_memory() {
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter(1, false))
+            .with_distributed_store(
+                Arc::new(DownStore) as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                true,
+            );
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, body, _) = full_status(transform, request).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "memory window decided"
+        );
+        assert_eq!(body, RATE_LIMITED_MESSAGE);
+    }
+
+    #[actix_web::test]
+    async fn custom_error_responses_reach_the_banned_shapes() {
+        let manager = IpBanManager::new();
+        let config = IpBanConfig::new(true, 10, 3600, no_entries()).expect("valid config");
+        let transform = GuardTransform::new(default_config())
+            .with_ip_banning(manager.clone(), config)
+            .with_custom_error_responses(
+                [(403u16, "denied:custom".to_owned())].into_iter().collect(),
+            );
+        manager
+            .ban_ip(IpAddr::from_str("192.0.2.200").expect("ip"), 60, "operator")
+            .expect("ban");
+        let request = TestRequest::get()
+            .uri("/hello")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, body, _) = full_status(transform, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body, "denied:custom",
+            "the live-ban shape takes the override"
+        );
     }
 }

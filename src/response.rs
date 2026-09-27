@@ -27,33 +27,8 @@ pub const OVERSIZE_MESSAGE: &str = "Payload too large";
 /// Detail message carried by the fail-secure `500` response.
 pub const FAILURE_MESSAGE: &str = "Security check failed";
 
-pub(crate) fn blocked(request: HttpRequest) -> ServiceResponse {
-    plain_text(request, StatusCode::BAD_REQUEST, BLOCKED_MESSAGE)
-}
-
 pub(crate) fn forbidden(request: HttpRequest) -> ServiceResponse {
     plain_text(request, StatusCode::FORBIDDEN, FORBIDDEN_MESSAGE)
-}
-
-/// The ban stage's denial: a live ban on the client IP.
-pub(crate) fn banned_ip(request: HttpRequest) -> ServiceResponse {
-    plain_text(request, StatusCode::FORBIDDEN, BANNED_MESSAGE)
-}
-
-/// The auto-ban engine's denial: the detected threat crossed a threshold and
-/// the ban fired on this very request.
-pub(crate) fn activity_banned(request: HttpRequest) -> ServiceResponse {
-    plain_text(request, StatusCode::FORBIDDEN, ACTIVITY_BANNED_MESSAGE)
-}
-
-/// The rate limiter's denial, carrying `Retry-After: <window seconds>` the
-/// way the references do.
-pub(crate) fn rate_limited(request: HttpRequest, retry_after: u64) -> ServiceResponse {
-    let response = HttpResponse::build(StatusCode::TOO_MANY_REQUESTS)
-        .insert_header((CONTENT_TYPE, "text/plain; charset=utf-8"))
-        .insert_header((RETRY_AFTER, retry_after.to_string()))
-        .body(RATE_LIMITED_MESSAGE);
-    ServiceResponse::new(request, response)
 }
 
 pub(crate) fn oversize(request: HttpRequest) -> ServiceResponse {
@@ -62,6 +37,43 @@ pub(crate) fn oversize(request: HttpRequest) -> ServiceResponse {
 
 pub(crate) fn failure(request: HttpRequest) -> ServiceResponse {
     plain_text(request, StatusCode::INTERNAL_SERVER_ERROR, FAILURE_MESSAGE)
+}
+
+/// The engine stage's block answer rendered in the family shape: the
+/// custom-error body override wins over the reference default message, and
+/// the throttled shape carries `Retry-After: <window seconds>`.
+pub(crate) fn stage(
+    request: HttpRequest,
+    stage: &guard_core_rs::tower::StageResponse,
+) -> ServiceResponse {
+    let status = StatusCode::from_u16(stage.status.as_u16()).expect("a valid stage status");
+    let mut response = match &stage.custom_body {
+        Some(body) => HttpResponse::build(status)
+            .insert_header((CONTENT_TYPE, "text/plain; charset=utf-8"))
+            .body(body.clone()),
+        None => HttpResponse::build(status)
+            .insert_header((CONTENT_TYPE, "text/plain; charset=utf-8"))
+            .body(stage.body),
+    };
+    if let Some(retry_after) = stage.retry_after {
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, retry_after.to_string().parse().expect("ascii"));
+    }
+    ServiceResponse::new(request, response)
+}
+
+/// The family block shape with a composed body override.
+pub(crate) fn blocked_with_body(
+    request: HttpRequest,
+    status: u16,
+    message: &str,
+) -> ServiceResponse {
+    let status = StatusCode::from_u16(status).expect("a valid block status");
+    let response = HttpResponse::build(status)
+        .insert_header((CONTENT_TYPE, "text/plain; charset=utf-8"))
+        .body(message.to_owned());
+    ServiceResponse::new(request, response)
 }
 
 /// The ecosystem's error shape: the bare message as the body,
@@ -84,25 +96,6 @@ mod tests {
     }
 
     #[test]
-    fn blocked_response_shape() {
-        let response = blocked(test_request());
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            response
-                .headers()
-                .get(CONTENT_TYPE)
-                .expect("content type")
-                .to_str()
-                .expect("ascii"),
-            "text/plain; charset=utf-8"
-        );
-        assert_eq!(
-            response.into_body().try_into_bytes().expect("bytes"),
-            Bytes::from_static(b"Suspicious activity detected")
-        );
-    }
-
-    #[test]
     fn forbidden_response_shape() {
         let response = forbidden(test_request());
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -118,45 +111,6 @@ mod tests {
         assert_eq!(
             response.into_body().try_into_bytes().expect("bytes"),
             Bytes::from_static(b"Forbidden")
-        );
-    }
-
-    #[test]
-    fn banned_response_shape() {
-        let response = banned_ip(test_request());
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            response.into_body().try_into_bytes().expect("bytes"),
-            Bytes::from_static(b"IP address banned")
-        );
-    }
-
-    #[test]
-    fn activity_banned_response_shape() {
-        let response = activity_banned(test_request());
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            response.into_body().try_into_bytes().expect("bytes"),
-            Bytes::from_static(b"IP has been banned")
-        );
-    }
-
-    #[test]
-    fn rate_limited_response_shape_carries_retry_after() {
-        let response = rate_limited(test_request(), 90);
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            response
-                .headers()
-                .get(RETRY_AFTER)
-                .expect("retry after")
-                .to_str()
-                .expect("ascii"),
-            "90"
-        );
-        assert_eq!(
-            response.into_body().try_into_bytes().expect("bytes"),
-            Bytes::from_static(b"Too many requests")
         );
     }
 
