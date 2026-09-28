@@ -1,0 +1,6 @@
+# Same waiver as deny.toml [advisories]: h2 0.3.x is the last branch
+# actix-http 3.x accepts, and 0.3.27 (the latest) is the flagged one; the
+# fix lives in h2 0.4, which actix-http does not consume yet.
+# Drop this entry when actix-http migrates to h2 0.4.
+[advisories]
+ignore = ["RUSTSEC-2026-0258"]
