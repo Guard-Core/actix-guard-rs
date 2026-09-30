@@ -790,4 +790,39 @@ mod tests {
         let transform = transform.with_body_cap(1024);
         assert_eq!(transform.body_cap(), 1024);
     }
+
+    #[test]
+    fn with_defaults_builds_the_corpus_config() {
+        let transform = GuardTransform::with_defaults();
+        assert_eq!(transform.body_cap(), 262_144);
+        let config = *transform.config();
+        assert_eq!(config.max_content_length, 10_000);
+        assert_eq!(config.max_full_scan_bytes, 262_144);
+        assert!(config.preserve_attack_patterns);
+        assert!((config.semantic_threshold - 0.7).abs() < f64::EPSILON);
+        assert!((config.threat_score_threshold - 1.0).abs() < f64::EPSILON);
+        assert_eq!(config.binary_min_run_length, 16);
+    }
+
+    #[test]
+    fn debug_prints_the_configuration_shape() {
+        let transform = GuardTransform::new(default_config()).with_ip_banning(
+            IpBanManager::new(),
+            IpBanConfig::new(true, 10, 3600, no_entries()).expect("valid config"),
+        );
+        let printed = format!("{transform:?}");
+        assert!(
+            printed.starts_with("GuardTransform"),
+            "the debug shape names the transform: {printed}"
+        );
+        assert!(
+            printed.contains("BanState"),
+            "the ban state renders through its own Debug: {printed}"
+        );
+    }
+
+    /// The empty `threat_ban_config`, typed so the `new` calls stay inferable.
+    fn no_entries() -> Vec<(String, ThreatBanEntry)> {
+        Vec::new()
+    }
 }

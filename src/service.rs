@@ -420,7 +420,9 @@ fn decode_query_component(component: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE, default_config};
+    use crate::{
+        BLOCKED_MESSAGE, FAILURE_MESSAGE, FORBIDDEN_MESSAGE, OVERSIZE_MESSAGE, default_config,
+    };
     use actix_web::body::MessageBody;
     use actix_web::dev::Transform;
     use actix_web::error::PayloadError;
@@ -501,6 +503,21 @@ mod tests {
             ),
             "the body blob should flag sqli once"
         );
+    }
+
+    #[actix_web::test]
+    async fn body_over_the_cap_is_rejected_with_413() {
+        // The buffering loop stops at the cap and the guard answers `413`
+        // instead of forwarding a truncated body.
+        let transform = GuardTransform::new(default_config()).with_body_cap(4);
+        let request = TestRequest::post()
+            .uri("/hello")
+            .set_payload(Bytes::from_static(b"12345"))
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, body, _) = full_status(transform, request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body, OVERSIZE_MESSAGE);
     }
 
     #[actix_web::test]
@@ -1259,7 +1276,7 @@ mod tests {
     /// The inner service used by the unit tests: answers `200` with an empty
     /// body, and never inspects the request. It is only reachable on the
     /// benign paths these tests exercise.
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct OkService;
 
     impl Service<ServiceRequest> for OkService {
@@ -1366,6 +1383,250 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "the extension tier wins over the resolver"
         );
+        // Without the extension the resolver's tier applies: the tight
+        // global limiter never crosses under the resolver's 100-request
+        // tier, so the request passes.
+        let request = TestRequest::get()
+            .uri("/tight")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform, request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the resolver tier decides when no extension is present"
+        );
+    }
+
+    #[actix_web::test]
+    async fn bare_query_param_scans_as_an_empty_value() {
+        // A parameter without an `=` (`?flag`) is still a surface: it is
+        // scanned with an empty value and never panics the pair decode.
+        let transform = GuardTransform::new(default_config());
+        let request = TestRequest::get()
+            .uri("/hello?flag&name=value")
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, _, _) = full_status(transform, request).await;
+        assert_eq!(status, StatusCode::OK, "benign bare params pass through");
+    }
+
+    #[actix_web::test]
+    async fn guard_service_debug_prints_the_configuration_shape() {
+        let guard = guarded(GuardTransform::new(default_config())).await;
+        let printed = format!("{guard:?}");
+        assert!(
+            printed.starts_with("GuardService"),
+            "the debug shape names the service: {printed}"
+        );
+        assert!(
+            printed.contains("OkService") && printed.contains("GuardTransform"),
+            "the inner service and the transform both render: {printed}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn poll_ready_reports_the_inner_service_readiness() {
+        let guard = guarded(GuardTransform::new(default_config())).await;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(guard.poll_ready(&mut cx), Poll::Ready(Ok(()))),
+            "the ready inner service passes readiness through"
+        );
+    }
+
+    #[actix_web::test]
+    async fn unattributed_detection_block_fires_the_on_block_payload() {
+        // The stage never sees an IP to attribute, so the adapter renders
+        // the plain detection block itself - and the observability seams
+        // (the payload, the hook) still fire.
+        let (payloads, hook) = block_collector();
+        let transform = GuardTransform::new(default_config())
+            .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+            .with_on_block(hook);
+        let request = TestRequest::get()
+            .uri("/files/../../etc/passwd")
+            .to_srv_request();
+        let (status, body) = status_body(transform, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, BLOCKED_MESSAGE);
+        let payloads = payloads.lock().expect("payloads");
+        assert_eq!(payloads.len(), 1, "exactly one payload for the block");
+        let payload = &payloads[0];
+        assert_eq!(payload.check_name, "suspicious_activity");
+        assert_eq!(payload.status_code, Some(400));
+        assert_eq!(payload.client_ip, "", "no peer address, no attribution");
+        assert_eq!(payload.path, "/files/../../etc/passwd");
+        assert_eq!(payload.method, "GET");
+        assert!(!payload.passive_mode);
+    }
+
+    #[actix_web::test]
+    async fn whitelisted_attacker_is_still_detected_with_the_full_payload() {
+        // Detection never skips a whitelisted IP: the stage's feed drops the
+        // finding (whitelisted IPs never count toward bans), so the adapter
+        // renders the plain block - and the payload carries the attributed
+        // IP, the request URL, and the user agent.
+        let (payloads, hook) = block_collector();
+        let gate = crate::IpGateConfig::new(["192.0.2.200"], NIL, NIL).expect("valid lists");
+        let transform = GuardTransform::new(default_config())
+            .with_ip_gate(gate)
+            .with_observability(guard_core_rs::tower::ObservabilityConfig::default())
+            .with_on_block(hook);
+        let request = TestRequest::get()
+            .uri("/files/../../etc/passwd?cmd=cat%20/etc/passwd")
+            .insert_header(("user-agent", "guard-test/1.0"))
+            .peer_addr(peer())
+            .to_srv_request();
+        let (status, body) = status_body(transform, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "detection still scans");
+        assert_eq!(body, BLOCKED_MESSAGE);
+        let payloads = payloads.lock().expect("payloads");
+        assert_eq!(payloads.len(), 1, "exactly one payload for the block");
+        let payload = &payloads[0];
+        assert_eq!(payload.client_ip, "192.0.2.200");
+        assert_eq!(
+            payload.path,
+            "/files/../../etc/passwd?cmd=cat%20/etc/passwd"
+        );
+        assert_eq!(payload.method, "GET");
+    }
+
+    #[actix_web::test]
+    async fn guard_service_clone_shares_the_inner_service() {
+        let guard = guarded(GuardTransform::new(default_config())).await;
+        let clone = guard.clone();
+        let request = TestRequest::get().uri("/hello").to_srv_request();
+        let response = clone.call(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "the clone serves too");
+    }
+
+    /// An in-memory sliding window (the backend is up): one hit per call,
+    /// post-eviction count returned, exactly the engine contract.
+    struct MemoryWindowStore(Mutex<std::collections::HashMap<String, Vec<f64>>>);
+
+    impl MemoryWindowStore {
+        fn new() -> Self {
+            Self(Mutex::new(std::collections::HashMap::new()))
+        }
+    }
+
+    impl guard_core_rs::tower::SlidingWindowStore for MemoryWindowStore {
+        fn record_hit(
+            &self,
+            key: &str,
+            now: f64,
+            window: u64,
+        ) -> Result<u64, guard_core_engine::distributed::StoreError> {
+            let mut windows = self.0.lock().expect("windows");
+            let hits = windows.entry(key.to_owned()).or_default();
+            hits.retain(|hit| now - hit < f64::from(u32::try_from(window).unwrap_or(u32::MAX)));
+            hits.push(now);
+            Ok(hits.len() as u64)
+        }
+    }
+
+    /// An in-memory ban store (the backend is up), optionally pre-seeded
+    /// with a (key, expiry) ban.
+    struct MemoryBanStore(Mutex<std::collections::HashMap<String, f64>>);
+
+    impl MemoryBanStore {
+        fn seeded(key: &str, expiry: f64) -> Self {
+            let mut bans = std::collections::HashMap::new();
+            bans.insert(key.to_owned(), expiry);
+            Self(Mutex::new(bans))
+        }
+    }
+
+    impl guard_core_engine::distributed::BanStore for MemoryBanStore {
+        fn set_ban(
+            &self,
+            key: &str,
+            expiry: f64,
+            _ttl_seconds: u64,
+        ) -> Result<(), guard_core_engine::distributed::StoreError> {
+            self.0.lock().expect("bans").insert(key.to_owned(), expiry);
+            Ok(())
+        }
+
+        fn get_ban(
+            &self,
+            key: &str,
+        ) -> Result<Option<f64>, guard_core_engine::distributed::StoreError> {
+            Ok(self.0.lock().expect("bans").get(key).copied())
+        }
+
+        fn delete_ban(&self, key: &str) -> Result<(), guard_core_engine::distributed::StoreError> {
+            self.0.lock().expect("bans").remove(key);
+            Ok(())
+        }
+    }
+
+    #[actix_web::test]
+    async fn distributed_stores_drive_the_ban_round_trip() {
+        // The distributed ban store is live: the first lookup reads a stale
+        // seeded ban and deletes it (the reference `_check_redis_exact`
+        // expiry sweep), the rate-limit crossing with the flat threshold of
+        // one bans on the spot and writes through the store, and the ban
+        // then answers `403` on the next request.
+        let ban_store = Arc::new(MemoryBanStore::seeded(
+            "guard_core:banned_ips:192.0.2.77",
+            1.0,
+        ));
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter(1, true))
+            .with_ip_banning(
+                IpBanManager::new(),
+                IpBanConfig::new(true, 1, 3600, no_entries()).expect("valid config"),
+            )
+            .with_distributed_store(
+                Arc::new(MemoryWindowStore::new())
+                    as Arc<dyn guard_core_rs::tower::SlidingWindowStore>,
+                "guard_core:",
+                false,
+            )
+            .with_distributed_ban_store(
+                Arc::clone(&ban_store) as Arc<dyn guard_core_engine::distributed::BanStore>
+            );
+        let build = || {
+            TestRequest::get()
+                .uri("/hello")
+                .peer_addr(std::net::SocketAddr::new(
+                    IpAddr::from_str("192.0.2.77").unwrap(),
+                    45_000,
+                ))
+                .to_srv_request()
+        };
+        // Stale distributed ban: swept, the request proceeds to the window.
+        let (status, _, _) = full_status(transform.clone(), build()).await;
+        assert_eq!(status, StatusCode::OK, "the stale ban was deleted");
+        assert!(
+            ban_store
+                .0
+                .lock()
+                .expect("bans")
+                .get("guard_core:banned_ips:192.0.2.77")
+                .is_none(),
+            "the sweep removed the stale entry"
+        );
+        // Crossing: the 429 goes out and the auto-ban writes the ban.
+        let (status, _, _) = full_status(transform.clone(), build()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let expiry = ban_store
+            .0
+            .lock()
+            .expect("bans")
+            .get("guard_core:banned_ips:192.0.2.77")
+            .copied()
+            .expect("the crossing banned through the distributed store");
+        assert!(
+            expiry > 1.0,
+            "the stored expiry is a live unix timestamp: {expiry}"
+        );
+        // The ban (cached locally by the write) answers first.
+        let (status, body, _) = full_status(transform, build()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, BANNED_MESSAGE);
     }
 
     #[actix_web::test]
