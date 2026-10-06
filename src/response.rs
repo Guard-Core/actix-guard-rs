@@ -39,6 +39,46 @@ pub(crate) fn failure(request: HttpRequest) -> ServiceResponse {
     plain_text(request, StatusCode::INTERNAL_SERVER_ERROR, FAILURE_MESSAGE)
 }
 
+/// The HTTPS-enforcement redirect: the reference status with the
+/// scheme-upgraded `Location` target and an empty body.
+pub(crate) fn redirect(
+    request: HttpRequest,
+    redirect: &guard_core_rs::https_enforcement::HttpsRedirectAnswer,
+) -> ServiceResponse {
+    let status = StatusCode::from_u16(redirect.status).expect("reference status");
+    let mut response = HttpResponse::build(status)
+        .insert_header((CONTENT_TYPE, "text/plain; charset=utf-8"))
+        .body("");
+    response.headers_mut().insert(
+        actix_web::http::header::LOCATION,
+        redirect
+            .location
+            .parse()
+            .expect("the composed location is a valid header value"),
+    );
+    ServiceResponse::new(request, response)
+}
+
+/// Land the response-side pass's headers (security headers + CORS verdict)
+/// on a response.
+pub(crate) fn apply_headers(
+    response: &mut HttpResponse,
+    headers: Option<actix_web::http::header::HeaderMap>,
+) {
+    let Some(headers) = headers else {
+        return;
+    };
+    for (name, value) in headers {
+        let Ok(name) = actix_web::http::header::HeaderName::try_from(name.as_str()) else {
+            continue;
+        };
+        let Ok(value) = actix_web::http::header::HeaderValue::from_bytes(value.as_bytes()) else {
+            continue;
+        };
+        response.headers_mut().insert(name, value);
+    }
+}
+
 /// The engine stage's block answer rendered in the family shape: the
 /// custom-error body override wins over the reference default message, and
 /// the throttled shape carries `Retry-After: <window seconds>`.

@@ -13,13 +13,16 @@ use guard_core_engine::detection_exclusions::{
 };
 use guard_core_engine::ip_gate::IpGateDecision;
 use guard_core_engine::ip_gate::IpGateVerdict;
+use guard_core_rs::process_response::{RequestBits, ResponseBits};
 use guard_core_rs::responses::{build_block_payload, fire_block_hook, resolve_error_body};
 use guard_core_rs::tower::{RequestObservation, RouteRateLimits};
+use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 
 /// Header names that are never scanned, mirroring the TypeScript adapters'
 /// `EXCLUDED_HEADERS` (plus every `sec-*` header).
@@ -117,35 +120,172 @@ where
         self.next.poll_ready(cx)
     }
 
+    #[allow(clippy::too_many_lines)] // the reference pipeline order, one arm per check
     fn call(&self, request: ServiceRequest) -> Self::Future {
         let next = Rc::clone(&self.next);
         let transform = self.transform.clone();
         Box::pin(async move {
             let (request, payload) = request.into_parts();
+            let facts = request_facts(&request);
 
             // The IP gate runs before anything else: a denied IP must not
             // cost a body buffer, and detection still scans whatever passes.
             if let Some(response) = enforce_ip_gate(&request, &transform) {
-                return Ok(response);
+                return Ok(finish_generated(&request, &transform, response));
             }
 
+            // Check 2: emergency mode (503 outside the whitelist).
+            if let Some(stage) = transform.emergency_mode()
+                && let Some(answer) = stage.decide(
+                    facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                    &facts.ip_string,
+                    &facts.path,
+                    &facts.method,
+                )
+            {
+                return Ok(finish_generated(
+                    &request,
+                    &transform,
+                    response::blocked_with_body(request.clone(), answer.status, &answer.body),
+                ));
+            }
+
+            // Check 3: HTTPS enforcement (301 to the scheme-upgraded URL).
+            if let Some(stage) = transform.https_enforcement() {
+                let https_url = format!(
+                    "https://{}{}{}",
+                    facts.host.as_deref().unwrap_or_default(),
+                    facts.path,
+                    facts.query
+                );
+                if let Some(redirect) = stage.decide(
+                    &facts.path,
+                    &facts.scheme,
+                    facts.host.as_deref().map(host_of_authority),
+                    facts.x_forwarded_proto.as_deref(),
+                    &https_url,
+                ) {
+                    return Ok(finish_generated(
+                        &request,
+                        &transform,
+                        response::redirect(request.clone(), &redirect),
+                    ));
+                }
+            }
+
+            // Check 4: request logging (compose-only, never blocks; the
+            // composed line is the host's to emit).
+            if let Some(stage) = transform.request_logging() {
+                let _ = stage.compose(
+                    facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                    Some(&facts.method),
+                    Some(&facts.path),
+                    None,
+                );
+            }
+
+            // Check 5: the request body buffers under the size cap (413) -
+            // the reference `request_size_content` stage.
             let buffered = match buffer_body(payload, transform.body_cap()).await {
                 Ok(buffered) => buffered,
-                Err(BufferFailure::TooLarge) => return Ok(response::oversize(request)),
-                Err(BufferFailure::Read) => return Ok(response::failure(request)),
+                Err(BufferFailure::TooLarge) => {
+                    return Ok(finish_generated(
+                        &request,
+                        &transform,
+                        response::oversize(request.clone()),
+                    ));
+                }
+                Err(BufferFailure::Read) => {
+                    return Ok(finish_generated(
+                        &request,
+                        &transform,
+                        response::failure(request.clone()),
+                    ));
+                }
             };
+
+            // Checks 6 + 7: required headers, then authentication.
+            if let Some(stage) = transform.headers_auth() {
+                let pairs: Vec<(&str, &str)> = request
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value.to_str().ok().map(|value| (name.as_str(), value))
+                    })
+                    .collect();
+                if let Some((_, answer)) = stage.decide(&facts.path, &pairs) {
+                    return Ok(block_response(
+                        &request,
+                        &transform,
+                        answer.status.as_u16(),
+                        &answer.body,
+                    ));
+                }
+            }
+
+            // Check 8: the route referrer gate.
+            if let Some(stage) = transform.referrer_gate()
+                && let Some(answer) = stage.decide(
+                    &facts.path,
+                    facts.referer.as_deref(),
+                    &facts.ip_string,
+                    &facts.path,
+                    &facts.method,
+                )
+            {
+                return Ok(block_response(
+                    &request,
+                    &transform,
+                    answer.status,
+                    &answer.body,
+                ));
+            }
+
+            // Check 9: the route custom validators (first blocking
+            // response wins, the validator's own shape).
+            if let Some(stage) = transform.custom_checks()
+                && let Some(failure) = stage.decide_custom_validators(
+                    &facts.path,
+                    &facts.method,
+                    facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                )
+            {
+                let status = failure.status.unwrap_or(200);
+                return Ok(block_response(&request, &transform, status, ""));
+            }
+
+            // Check 10: the route time-window gate.
+            if let Some(stage) = transform.time_window_gate()
+                && let Some(answer) =
+                    stage.decide(&facts.path, &facts.ip_string, &facts.path, &facts.method)
+            {
+                return Ok(block_response(
+                    &request,
+                    &transform,
+                    answer.status,
+                    &answer.body,
+                ));
+            }
+
+            // The detection scan itself never blocks: the verdict feeds
+            // the pipeline stages that do.
             let verdict = match scan_request(&request, buffered.as_ref(), &transform) {
                 ScanOutcome::Clean => None,
-                ScanOutcome::Failed => return Ok(response::failure(request)),
+                ScanOutcome::Failed => {
+                    return Ok(finish_generated(
+                        &request,
+                        &transform,
+                        response::failure(request.clone()),
+                    ));
+                }
                 ScanOutcome::Threat(verdict) => Some(verdict),
             };
 
-            // One engine-stage pass decides for every request: bans first
-            // (403 `IP address banned`), then the rate-limit tiers
-            // (429 + `Retry-After`), then the detection feed (the auto-ban
-            // engine may answer `403 IP has been banned` on this very
-            // request) - the reference pipeline order: `ip_security` (ban
-            // check), `rate_limit`, `suspicious_activity`.
+            // One engine-stage pass, split at the reference pipeline's
+            // seams so the interleaved checks sit where the reference puts
+            // them: the ban arm (check 12's `ip_security` bans) first, then
+            // geo (12b), cloud (13), user agent (14), and the rate-limit
+            // tiers + detection feed (15 + 16).
             let stage = transform
                 .stage()
                 .expect("the stage is built by Transform::new_transform");
@@ -157,16 +297,68 @@ where
                     trigger_info: verdict.reason.clone(),
                 });
             let observation = request_observation(&request);
-            let decision = stage.decide_for_path_observed(
-                client_ip(&request),
-                Some(request.path()),
-                request.extensions().get::<RouteRateLimits>(),
-                request.extensions().get::<IpGateDecision>().copied(),
+            if let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation)) {
+                return Ok(finish_generated(
+                    &request,
+                    &transform,
+                    response::stage(request.clone(), &blocked),
+                ));
+            }
+
+            if let Some(stage) = transform.geo_blocking()
+                && let Some(decision) = stage.decide(facts.ip, facts.gate)
+            {
+                return Ok(block_response(
+                    &request,
+                    &transform,
+                    decision.answer.status.as_u16(),
+                    stage_answer_body(&decision.answer),
+                ));
+            }
+
+            if let Some(stage) = transform.cloud_provider()
+                && let Some(decision) = stage.decide(facts.ip, facts.gate)
+            {
+                return Ok(block_response(
+                    &request,
+                    &transform,
+                    decision.answer.status.as_u16(),
+                    stage_answer_body(&decision.answer),
+                ));
+            }
+
+            if let Some(stage) = transform.user_agent()
+                && let Some(answer) = stage.decide(
+                    facts.ip,
+                    facts.gate,
+                    Some(&facts.path),
+                    facts.user_agent.as_deref(),
+                    finding.as_ref(),
+                )
+            {
+                return Ok(block_response(
+                    &request,
+                    &transform,
+                    answer.status.as_u16(),
+                    stage_answer_body(&answer),
+                ));
+            }
+
+            let route = request.extensions().get::<RouteRateLimits>().cloned();
+            let gate = request.extensions().get::<IpGateDecision>().copied();
+            if let Some(blocked) = stage.decide_tiers_observed(
+                facts.ip,
+                Some(&facts.path),
+                route.as_ref(),
+                gate,
                 finding.as_ref(),
                 Some(&observation),
-            );
-            if let Some(blocked) = decision {
-                return Ok(response::stage(request, &blocked));
+            ) {
+                return Ok(finish_generated(
+                    &request,
+                    &transform,
+                    response::stage(request.clone(), &blocked),
+                ));
             }
             if let (Some(verdict), false) = (&verdict, stage.config().passive_mode) {
                 // Below-threshold detection (or an unattributed request):
@@ -174,23 +366,62 @@ where
                 // detection was observed and counted by the stage and the
                 // request forwards (the reference's passive path renders
                 // no block).
-                return Ok(detection_block(&request, &transform, verdict));
+                let status = 400;
+                let body = resolve_error_body(
+                    transform.custom_error_responses(),
+                    status,
+                    response::BLOCKED_MESSAGE,
+                );
+                if let Some(observability) = transform.observability() {
+                    let observation = request_observation(&request);
+                    let payload = build_block_payload(
+                        "suspicious_activity",
+                        &format!("Suspicious activity detected: {}", facts.ip_string),
+                        &verdict.reason,
+                        false,
+                        &facts.ip_string,
+                        observation.url.as_deref().unwrap_or("/"),
+                        observation.method.as_deref().unwrap_or(""),
+                        Some(status),
+                        &observability.sensitive,
+                    );
+                    fire_block_hook(transform.on_block(), &payload);
+                }
+                return Ok(block_response(&request, &transform, status, &body));
             }
+
+            // Check 17: the global `custom_request` function (its own
+            // response shape; a response without a status renders the
+            // framework default 200).
+            if let Some(stage) = transform.custom_checks()
+                && let Some(answer) = stage.decide_custom_request(
+                    &facts.method,
+                    &facts.path,
+                    facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                )
+            {
+                let status = answer.status.unwrap_or(200);
+                return Ok(block_response(&request, &transform, status, ""));
+            }
+
             // actix Web consumes the payload while buffering, so the
             // request the next service sees is rebuilt around the
             // buffered bytes (see the crate docs on request rebuilding).
             let rebuilt =
                 ServiceRequest::from_parts(request, Payload::from(buffered.unwrap_or_default()));
-            next.call(rebuilt)
+            let mut forwarded = next
+                .call(rebuilt)
                 .await
-                .map(ServiceResponse::map_into_boxed_body)
+                .map(ServiceResponse::map_into_boxed_body)?;
+            run_response_processor(
+                &transform,
+                &facts,
+                forwarded.status().as_u16(),
+                forwarded.response_mut(),
+            );
+            Ok(forwarded)
         })
     }
-}
-
-/// The request's attributed client IP, when the peer address exists.
-fn client_ip(request: &HttpRequest) -> Option<std::net::IpAddr> {
-    request.peer_addr().map(|peer| peer.ip())
 }
 
 /// The request pieces the stage's event and log emissions read.
@@ -212,41 +443,205 @@ fn request_observation(request: &HttpRequest) -> RequestObservation {
     }
 }
 
-/// The plain detection block for a flagged request whose violations did
-/// not cross a ban threshold (or that carried no client IP to attribute):
-/// the family's `400 Bad Request` (`Suspicious activity detected`), with
-/// the `custom_error_responses` body override and the reference `on_block`
-/// payload when the corresponding seams are installed.
-fn detection_block(
+/// The request facts the pipeline stages read (the actix mirror of the
+/// tower adapter's `RequestFacts`).
+struct RequestFacts {
+    ip: Option<std::net::IpAddr>,
+    gate: Option<IpGateDecision>,
+    ip_string: String,
+    path: String,
+    method: String,
+    scheme: String,
+    referer: Option<String>,
+    user_agent: Option<String>,
+    host: Option<String>,
+    x_forwarded_proto: Option<String>,
+    origin: Option<String>,
+    query: String,
+}
+
+/// Extract the facts from an actix request: the peer address is the
+/// client identity, the connection info carries the host and scheme.
+fn request_facts(request: &HttpRequest) -> RequestFacts {
+    // Every extensions borrow lands in a local before the struct literal:
+    // `connection_info()` mutates the extensions cache internally, and a
+    // live immutable borrow inside the literal would double-borrow.
+    let ip = request.peer_addr().map(|peer| peer.ip());
+    let gate = request.extensions().get::<IpGateDecision>().copied();
+    let scheme = request.connection_info().scheme().to_owned();
+    let referer = header_string(request, header::REFERER);
+    let user_agent = header_string(request, header::USER_AGENT);
+    let host = header_string(request, header::HOST);
+    let x_forwarded_proto = header_string(request, header::X_FORWARDED_PROTO);
+    let origin = header_string(request, header::ORIGIN);
+    let query = request.query_string();
+    RequestFacts {
+        ip,
+        gate,
+        ip_string: ip.map_or_else(String::new, |addr| addr.to_string()),
+        path: request.path().to_owned(),
+        method: request.method().as_str().to_owned(),
+        scheme,
+        referer,
+        user_agent,
+        host,
+        x_forwarded_proto,
+        origin,
+        query: if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{query}")
+        },
+    }
+}
+
+fn header_string(request: &HttpRequest, name: header::HeaderName) -> Option<String> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// The bare host of an authority string (port stripped, IPv6 brackets
+/// removed): the connecting identity the trusted-proxy arm compares.
+fn host_of_authority(value: &str) -> &str {
+    let host_port = value.rsplit('@').next().unwrap_or_default();
+    if let Some(rest) = host_port.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host_port.split_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => host_port,
+    }
+}
+
+/// The resolved answer body of a stage answer (the custom-error override
+/// already travels inside `custom_body`).
+fn stage_answer_body(answer: &guard_core_rs::tower::StageResponse) -> &str {
+    match &answer.custom_body {
+        Some(custom) => custom,
+        None => answer.body,
+    }
+}
+
+/// A guard block answer with the response-side pass applied.
+fn block_response(
     request: &HttpRequest,
     transform: &GuardTransform,
-    verdict: &guard_core_engine::detection_exclusions::RequestScanVerdict,
+    status: u16,
+    body: &str,
 ) -> ServiceResponse {
-    let status = 400;
-    let body = resolve_error_body(
-        transform.custom_error_responses(),
-        status,
-        response::BLOCKED_MESSAGE,
+    finish_generated(
+        request,
+        transform,
+        response::blocked_with_body(request.clone(), status, body),
+    )
+}
+
+/// A guard-generated answer (block, redirect, oversize, failure) with the
+/// response-side pass applied.
+fn finish_generated(
+    request: &HttpRequest,
+    transform: &GuardTransform,
+    mut response: ServiceResponse,
+) -> ServiceResponse {
+    run_response_processor_parts(
+        transform,
+        request,
+        response.status().as_u16(),
+        &mut response,
     );
-    if let Some(observability) = transform.observability() {
-        let ip = client_ip(request)
-            .map(|ip| ip.to_string())
-            .unwrap_or_default();
-        let observation = request_observation(request);
-        let payload = build_block_payload(
-            "suspicious_activity",
-            &format!("Suspicious activity detected: {ip}"),
-            &verdict.reason,
-            false,
-            &ip,
-            observation.url.as_deref().unwrap_or("/"),
-            observation.method.as_deref().unwrap_or(""),
-            Some(status),
-            &observability.sensitive,
-        );
-        fire_block_hook(transform.on_block(), &payload);
+    response
+}
+
+/// Run the response-side pass over a `ServiceResponse`.
+fn run_response_processor_parts(
+    transform: &GuardTransform,
+    request: &HttpRequest,
+    status: u16,
+    response: &mut ServiceResponse,
+) {
+    if transform.response_processor().is_none() {
+        return;
     }
-    response::blocked_with_body(request.clone(), status, &body)
+    let headers = compute_processor_headers(
+        transform,
+        request.method().as_str(),
+        request.path(),
+        request
+            .peer_addr()
+            .map_or_else(String::new, |peer| peer.ip().to_string())
+            .as_str(),
+        request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        status,
+    );
+    let http = response.response_mut();
+    response::apply_headers(http, headers);
+}
+
+/// Run the response-side pass over a forwarded response (the request was
+/// already consumed into the service call, so the facts carry the pieces).
+fn run_response_processor(
+    transform: &GuardTransform,
+    facts: &RequestFacts,
+    status: u16,
+    response: &mut actix_web::HttpResponse,
+) {
+    if transform.response_processor().is_none() {
+        return;
+    }
+    let headers = compute_processor_headers(
+        transform,
+        &facts.method,
+        &facts.path,
+        &facts.ip_string,
+        facts.origin.as_deref(),
+        status,
+    );
+    response::apply_headers(response, headers);
+}
+
+/// The response-side pass itself: the global `return_pattern` rules
+/// evaluate the response (a crossed `ban` lands in the processor's IP-ban
+/// store), then the security-header set and the CORS verdict headers
+/// compose. The response body is not captured (`body_prefix = None`):
+/// `status:` rules evaluate, body rules skip, exactly the reference's
+/// no-capture seam.
+fn compute_processor_headers(
+    transform: &GuardTransform,
+    method: &str,
+    url_path: &str,
+    client_ip: &str,
+    origin: Option<&str>,
+    status: u16,
+) -> Option<actix_web::http::header::HeaderMap> {
+    let processor = transform.response_processor()?;
+    let mut bits = ResponseBits {
+        status,
+        body: None,
+        headers: BTreeMap::new(),
+    };
+    let request = RequestBits {
+        method: method.to_owned(),
+        url_path: url_path.to_owned(),
+        client_ip: client_ip.to_owned(),
+        origin: origin.map(ToOwned::to_owned),
+    };
+    let _action = processor.process(&request, &mut bits, None, SystemTime::now());
+    let mut headers = actix_web::http::header::HeaderMap::new();
+    for (name, value) in bits.headers {
+        if let (Ok(name), Ok(value)) = (
+            actix_web::http::header::HeaderName::try_from(name.as_str()),
+            actix_web::http::header::HeaderValue::from_str(&value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    Some(headers)
 }
 
 /// Apply the configured IP gate to the request.
