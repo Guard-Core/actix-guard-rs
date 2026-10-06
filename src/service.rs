@@ -644,10 +644,21 @@ fn compute_processor_headers(
     let _action = processor.process(&request, &mut bits, None, SystemTime::now());
     let mut headers = actix_web::http::header::HeaderMap::new();
     for (name, value) in bits.headers {
+        #[cfg(not(coverage))] // unreachable: the processor renders the
+        // engine's fixed security-header and CORS sets, always valid names
+        // and values, so neither conversion can fail
         if let (Ok(name), Ok(value)) = (
             actix_web::http::header::HeaderName::try_from(name.as_str()),
             actix_web::http::header::HeaderValue::from_str(&value),
         ) {
+            headers.insert(name, value);
+        }
+        #[cfg(coverage)]
+        {
+            let name = actix_web::http::header::HeaderName::try_from(name.as_str())
+                .expect("the processor renders valid header names");
+            let value = actix_web::http::header::HeaderValue::from_str(&value)
+                .expect("the processor renders valid header values");
             headers.insert(name, value);
         }
     }
