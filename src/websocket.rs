@@ -484,7 +484,7 @@ where
     }
 }
 
-/// The actix [`Service`](actix_web::dev::Service) produced by
+/// The actix [`actix_web::dev::Service`] produced by
 /// [`WebSocketGuard::new_transform`].
 pub struct WebSocketGuardService<S> {
     inner: S,
