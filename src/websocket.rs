@@ -551,6 +551,13 @@ mod tests {
         crate::default_config()
     }
 
+    /// The route handler the clean and blocked upgrade tests share: one fn
+    /// item, one routing instantiation, exercised by the clean test (the
+    /// blocked test's handshake is rejected before dispatch).
+    async fn upgraded() -> &'static str {
+        "upgraded"
+    }
+
     #[test]
     fn close_table_matches_the_reference() {
         assert_eq!(
@@ -651,7 +658,7 @@ mod tests {
                 (String::from("bad"), String::from("%zz")),
             ]
         );
-        assert!(parse_query_pairs("").is_empty());
+        assert_eq!(parse_query_pairs(""), Vec::<(String, String)>::new());
         assert_eq!(decode_component("caf%C3%A9"), "café");
     }
 
@@ -828,6 +835,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn debug_prints_the_config_shape() {
+        let config = WebSocketGuardConfig::new(detect_config()).with_fail_secure(true);
+        let printed = format!("{config:?}");
+        assert!(
+            printed.starts_with("WebSocketGuardConfig"),
+            "the debug shape names the config: {printed}"
+        );
+        assert!(printed.contains("fail_secure: true"), "{printed}");
+    }
+
+    #[test]
+    fn detection_exclusions_shape_the_scan_arm() {
+        let exclusions = DetectionExclusionConfig {
+            excluded_detection_params: vec!["secret".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let config =
+            WebSocketGuardConfig::new(detect_config()).with_detection_exclusions(&exclusions);
+        let ip: IpAddr = "203.0.113.9".parse().expect("ip");
+        // The excluded param name skips the scan entirely.
+        assert_eq!(
+            run_websocket_checks(
+                &config,
+                Some(ip),
+                "/ws",
+                &[(
+                    "secret".to_owned(),
+                    String::from("<script>alert(1)</script>")
+                )],
+                &[],
+            ),
+            Ok(())
+        );
+        // Any other name scans.
+        assert_eq!(
+            run_websocket_checks(
+                &config,
+                Some(ip),
+                "/ws",
+                &[(
+                    "public".to_owned(),
+                    String::from("<script>alert(1)</script>")
+                )],
+                &[],
+            ),
+            Err(WS_CLOSE_SUSPICIOUS_ACTIVITY)
+        );
+    }
+
     struct PanickingCountry;
 
     impl GeoIpHandler for PanickingCountry {
@@ -873,6 +930,23 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn poll_ready_forwards_through_the_transform() {
+        let config = WebSocketGuardConfig::new(detect_config());
+        let service = init_service(
+            actix_web::App::new()
+                .wrap(WebSocketGuard::new(config))
+                .route("/ws", actix_web::web::get().to(upgraded)),
+        )
+        .await;
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(matches!(
+            actix_web::dev::Service::poll_ready(&service, &mut cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[actix_web::test]
     async fn blocked_upgrade_is_rejected_pre_accept() {
         let manager = IpBanManager::new();
         let ip: IpAddr = "203.0.113.9".parse().expect("ip");
@@ -881,7 +955,7 @@ mod tests {
         let service = init_service(
             actix_web::App::new()
                 .wrap(WebSocketGuard::new(config))
-                .route("/ws", actix_web::web::get().to(|| async { "upgraded" })),
+                .route("/ws", actix_web::web::get().to(upgraded)),
         )
         .await;
         let request = TestRequest::get()
@@ -922,7 +996,7 @@ mod tests {
         let service = init_service(
             actix_web::App::new()
                 .wrap(WebSocketGuard::new(config))
-                .route("/ws", actix_web::web::get().to(|| async { "upgraded" })),
+                .route("/ws", actix_web::web::get().to(upgraded)),
         )
         .await;
         let request = TestRequest::get()
