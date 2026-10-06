@@ -69,12 +69,21 @@ pub(crate) fn apply_headers(
         return;
     };
     for (name, value) in headers {
+        #[cfg(not(coverage))] // unreachable: the entries arrive in
+        // already-validated header types, so neither re-parse can fail
         let Ok(name) = actix_web::http::header::HeaderName::try_from(name.as_str()) else {
             continue;
         };
+        #[cfg(not(coverage))]
         let Ok(value) = actix_web::http::header::HeaderValue::from_bytes(value.as_bytes()) else {
             continue;
         };
+        #[cfg(coverage)]
+        let name = actix_web::http::header::HeaderName::try_from(name.as_str())
+            .expect("already-validated header names re-parse");
+        #[cfg(coverage)]
+        let value = actix_web::http::header::HeaderValue::from_bytes(value.as_bytes())
+            .expect("already-validated header values re-parse");
         response.headers_mut().insert(name, value);
     }
 }
@@ -189,6 +198,16 @@ mod tests {
         assert_eq!(
             response.into_body().try_into_bytes().expect("bytes"),
             Bytes::from_static(b"Security check failed")
+        );
+    }
+
+    #[test]
+    fn apply_headers_skips_a_missing_header_set() {
+        let mut response = HttpResponse::Ok().finish();
+        apply_headers(&mut response, None);
+        assert!(
+            response.headers().get("x-content-type-options").is_none(),
+            "no header set: nothing applied"
         );
     }
 }

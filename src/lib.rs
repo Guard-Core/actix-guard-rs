@@ -103,8 +103,30 @@
 //! ban/auto-ban stage (`GuardTransform::with_ip_banning`) skip whitelisted and
 //! exempt IPs for exactly what the reference skips (rate limiting, violation
 //! counting, banning) and never skip detection, which always scans every
-//! request, exempt or not. A user-agent filter and cloud-provider blocking
-//! do not exist yet.
+//! request, exempt or not.
+//!
+//! ## The full stage surface (the reference 17-check pipeline, wired)
+//!
+//! Every reference check the engine ships is now installable on
+//! [`GuardTransform`], and [`GuardService`] runs the installed set in the
+//! reference pipeline order:
+//!
+//! | Reference check | Builder |
+//! |---|---|
+//! | 2 `emergency_mode` | [`GuardTransform::with_emergency_mode`] |
+//! | 3 `https_enforcement` | [`GuardTransform::with_https_enforcement`] |
+//! | 4 `request_logging` | [`GuardTransform::with_request_logging`] |
+//! | 5 `request_size_content` | [`GuardTransform::with_body_cap`] (413) |
+//! | 6 + 7 `required_headers` / authentication | [`GuardTransform::with_headers_auth`] |
+//! | 8 referrer | [`GuardTransform::with_referrer_gate`] |
+//! | 9 `custom_validators` | [`GuardTransform::with_custom_checks`] |
+//! | 10 `time_window` | [`GuardTransform::with_time_window_gate`] |
+//! | 12b geo country blocking | [`GuardTransform::with_geo_blocking`] |
+//! | 13 `cloud_provider` | [`GuardTransform::with_cloud_provider`] |
+//! | 14 `user_agent` | [`GuardTransform::with_user_agent`] |
+//! | 12a / 15 / 16 bans / `rate_limit` / detection feed | [`GuardTransform::with_rate_limiting`] + [`GuardTransform::with_ip_banning`] |
+//! | 17 `custom_request` | [`GuardTransform::with_custom_checks`] |
+//! | response pass (return rules + security headers + CORS) | [`GuardTransform::with_response_processor`] |
 //!
 //! These bodies follow the ecosystem's plain-text convention (the bare
 //! message, `text/plain; charset=utf-8`, same as the Python family) but
@@ -754,7 +776,8 @@ impl GuardTransform {
     /// [`CloudIpTable::set_provider_ranges`] and refresh it from a
     /// background fetcher (`guard_core_rs::cloud_fetch`).
     ///
-    /// [`CloudIpTable`]: guard_core_rs::cloud_provider::CloudIpTable
+    /// [`CloudIpTable::set_provider_ranges`]:
+    /// guard_core_rs::cloud_provider::CloudIpTable::set_provider_ranges
     #[must_use]
     pub fn with_cloud_provider(mut self, stage: CloudProviderStage) -> Self {
         self.cloud_provider = Some(stage);

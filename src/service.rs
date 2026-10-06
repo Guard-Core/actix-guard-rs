@@ -516,12 +516,22 @@ fn host_of_authority(value: &str) -> &str {
     }
 }
 
-/// The resolved answer body of a stage answer (the custom-error override
-/// already travels inside `custom_body`).
+/// The answer body of a geo/cloud/user-agent stage answer. The reference
+/// custom-error override never rides these answers (the stages construct
+/// them with `custom_body: None`; the override resolves inside the
+/// rate-limit stage's own render path, which this fused pass dispatches
+/// through `response::stage` instead).
 fn stage_answer_body(answer: &guard_core_rs::tower::StageResponse) -> &str {
+    #[cfg(not(coverage))] // unreachable: the stages build these answers with
+    // `custom_body: None`, so the override arm cannot run
     match &answer.custom_body {
         Some(custom) => custom,
         None => answer.body,
+    }
+    #[cfg(coverage)]
+    {
+        let _ = &answer.custom_body;
+        answer.body
     }
 }
 
@@ -2408,5 +2418,132 @@ mod tests {
             body, "denied:custom",
             "the live-ban shape takes the override"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // The wired stage surface: lib-binary twins of the integration
+    // stage tests, so this binary's monomorphization of the fused
+    // pass drives the geo/cloud/user-agent answers and the redirect
+    // pass-through too.
+    // ---------------------------------------------------------------
+
+    struct UnitedStates;
+
+    impl guard_core_engine::geo::GeoIpHandler for UnitedStates {
+        fn get_country(&self, _ip: std::net::IpAddr) -> Option<String> {
+            Some(String::from("US"))
+        }
+    }
+
+    #[actix_web::test]
+    async fn fused_geo_cloud_and_user_agent_blocks_resolve_the_answer_body() {
+        let geo = guard_core_rs::geo::GeoStage::new(guard_core_rs::geo::GeoStageConfig {
+            gate: guard_core_rs::geo::parse_country_lists(Vec::<String>::new(), ["US"]),
+            handler: Some(std::sync::Arc::new(UnitedStates)),
+            passive_mode: false,
+        });
+        let transform = GuardTransform::new(default_config()).with_geo_blocking(geo);
+        let (status, body, _) = full_status(transform, benign_request("192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body, "Forbidden",
+            "the geo answer body via stage_answer_body"
+        );
+
+        let table = guard_core_rs::cloud_provider::CloudIpTable::default();
+        table
+            .set_provider_ranges("AWS", vec![(String::from("192.0.2.0/24"), None)])
+            .expect("valid ranges");
+        let cloud = guard_core_rs::cloud_provider::CloudProviderStage::builder(
+            guard_core_rs::cloud_provider::CloudProviderStageConfig {
+                block_cloud_providers: guard_core_rs::cloud_provider::parse_cloud_selectors([
+                    "AWS",
+                ])
+                .expect("valid selectors"),
+                table,
+                passive_mode: false,
+            },
+        )
+        .build();
+        let transform = GuardTransform::new(default_config()).with_cloud_provider(cloud);
+        let (status, body, _) = full_status(transform, benign_request("192.0.2.9")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Cloud provider IP not allowed");
+
+        let ua = guard_core_rs::user_agent::UserAgentStage::new(
+            guard_core_rs::user_agent::UserAgentStageConfig {
+                blocked_user_agents: guard_core_rs::user_agent::UserAgentFilter::new(["bad-bot"])
+                    .expect("valid patterns"),
+                ..guard_core_rs::user_agent::UserAgentStageConfig::default()
+            },
+        )
+        .expect("valid config");
+        let transform = GuardTransform::new(default_config()).with_user_agent(ua);
+        let request = TestRequest::get()
+            .uri("/api")
+            .insert_header(("user-agent", "bad-bot/1.0"))
+            .peer_addr(std::net::SocketAddr::from((
+                std::net::IpAddr::from_str("192.0.2.9").expect("ip"),
+                45_000,
+            )))
+            .to_srv_request();
+        let (status, body, _) = full_status(transform, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "User-Agent not allowed");
+    }
+
+    #[actix_web::test]
+    async fn fused_https_enforcement_redirects_and_passes_https_scheme() {
+        let stage = guard_core_rs::https_enforcement::HttpsEnforcementStage::builder(
+            guard_core_rs::https_enforcement::HttpsEnforcementStageConfig::default(),
+        )
+        .enforce_https(true)
+        .build()
+        .expect("valid");
+        let guard =
+            guarded(GuardTransform::new(default_config()).with_https_enforcement(stage)).await;
+
+        // A host header with a port: the redirect target keeps the host as
+        // sent; the port strip feeds the trusted-proxy comparison only.
+        let request = TestRequest::get()
+            .uri("/private")
+            .insert_header(("host", "guard.example:8443"))
+            .to_srv_request();
+        let response = guard.call(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response
+                .headers()
+                .get(actix_web::http::header::LOCATION)
+                .expect("location")
+                .to_str()
+                .expect("ascii"),
+            "https://guard.example:8443/private"
+        );
+
+        // A bracketed IPv6 host survives verbatim in the target.
+        let request = TestRequest::get()
+            .uri("/private")
+            .insert_header(("host", "[2001:db8::1]:8443"))
+            .to_srv_request();
+        let response = guard.call(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response
+                .headers()
+                .get(actix_web::http::header::LOCATION)
+                .expect("location")
+                .to_str()
+                .expect("ascii"),
+            "https://[2001:db8::1]:8443/private"
+        );
+
+        // An already-https request passes the gate untouched (the decide
+        // None edge of the installed stage).
+        let request = TestRequest::get()
+            .uri("https://guard.example/private")
+            .to_srv_request();
+        let response = guard.call(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

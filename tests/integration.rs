@@ -801,3 +801,141 @@ async fn a_return_pattern_rule_bans_at_the_threshold_through_the_fused_pipeline(
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body, "IP address banned");
 }
+
+#[actix_web::test]
+async fn https_enforcement_host_forms_feed_the_trusted_proxy_comparison() {
+    let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+        .enforce_https(true)
+        .build()
+        .expect("valid");
+    let guard = GuardTransform::new(default_config())
+        .with_https_enforcement(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    // A host header with a port: the redirect target keeps the host as
+    // sent; the port strip feeds the trusted-proxy comparison only.
+    let request = TestRequest::get()
+        .uri("/private")
+        .insert_header(("host", "guard.example:8443"))
+        .to_srv_request();
+    let response = guard.call(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCATION)
+            .expect("location")
+            .to_str()
+            .expect("ascii"),
+        "https://guard.example:8443/private"
+    );
+
+    // A bracketed IPv6 host survives verbatim in the target.
+    let request = TestRequest::get()
+        .uri("/private")
+        .insert_header(("host", "[2001:db8::1]:8443"))
+        .to_srv_request();
+    let response = guard.call(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCATION)
+            .expect("location")
+            .to_str()
+            .expect("ascii"),
+        "https://[2001:db8::1]:8443/private"
+    );
+}
+
+#[actix_web::test]
+async fn request_logging_stage_composes_and_never_blocks() {
+    let stage =
+        actix_guard_rs::RequestLoggingStage::new(actix_guard_rs::RequestLoggingStageConfig {
+            log_request_level: Some(guard_core_rs::logging::LogLevel::Info),
+            ..actix_guard_rs::RequestLoggingStageConfig::default()
+        });
+    assert!(stage.exists(), "the reference construction gate");
+    let guard = GuardTransform::new(default_config())
+        .with_request_logging(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, _) = status_of(&guard, attributed_get("/api", "192.0.2.9")).await;
+    assert_eq!(status, StatusCode::OK, "the logging stage never blocks");
+
+    // An attack still blocks through the same pipeline.
+    let (status, body) = status_of(&guard, post("/api/comment", "<script>alert(1)</script>")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, BLOCKED_MESSAGE);
+}
+
+#[actix_web::test]
+async fn geo_cloud_and_user_agent_blocks_resolve_the_answer_body() {
+    use guard_core_rs::geo::{GeoStage, GeoStageConfig, parse_country_lists};
+    struct UnitedStates;
+    impl GeoIpHandler for UnitedStates {
+        fn get_country(&self, _ip: std::net::IpAddr) -> Option<String> {
+            Some(String::from("US"))
+        }
+    }
+
+    let geo = GeoStage::new(GeoStageConfig {
+        gate: parse_country_lists(Vec::<String>::new(), ["US"]),
+        handler: Some(Arc::new(UnitedStates)),
+        passive_mode: false,
+    });
+    let guard = GuardTransform::new(default_config())
+        .with_geo_blocking(geo)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+    let (status, body) = status_of(&guard, attributed_get("/api", "192.0.2.9")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        body, "Forbidden",
+        "the geo answer body via stage_answer_body"
+    );
+
+    let table = CloudIpTable::default();
+    table
+        .set_provider_ranges("AWS", vec![(String::from("192.0.2.0/24"), None)])
+        .expect("valid ranges");
+    let cloud =
+        CloudProviderStage::builder(guard_core_rs::cloud_provider::CloudProviderStageConfig {
+            block_cloud_providers: parse_cloud_selectors(["AWS"]).expect("valid selectors"),
+            table,
+            passive_mode: false,
+        })
+        .build();
+    let guard = GuardTransform::new(default_config())
+        .with_cloud_provider(cloud)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+    let (status, body) = status_of(&guard, attributed_get("/api", "192.0.2.9")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "Cloud provider IP not allowed");
+
+    let ua = UserAgentStage::new(UserAgentStageConfig {
+        blocked_user_agents: guard_core_rs::user_agent::UserAgentFilter::new(["bad-bot"])
+            .expect("valid patterns"),
+        ..UserAgentStageConfig::default()
+    })
+    .expect("valid config");
+    let guard = GuardTransform::new(default_config())
+        .with_user_agent(ua)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+    let request = TestRequest::get()
+        .uri("/api")
+        .insert_header(("user-agent", "bad-bot/1.0"))
+        .to_srv_request();
+    let (status, body) = status_of(&guard, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "User-Agent not allowed");
+}
