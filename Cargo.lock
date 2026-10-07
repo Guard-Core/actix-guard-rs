@@ -34,6 +34,7 @@ version = "1.4.0"
 dependencies = [
  "actix-web",
  "bytes",
+ "chrono",
  "futures-core",
  "guard-core-engine",
  "guard-core-rs",

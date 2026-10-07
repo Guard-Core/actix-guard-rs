@@ -5,7 +5,7 @@ use actix_guard_rs::{BLOCKED_MESSAGE, GuardTransform, OVERSIZE_MESSAGE, default_
 use actix_web::body::MessageBody;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
 use actix_web::http::StatusCode;
-use actix_web::http::header::CONTENT_TYPE;
+use actix_web::http::header::{CONTENT_TYPE, LOCATION};
 use actix_web::test::{TestRequest, call_service, init_service, read_body};
 use actix_web::{App, Error, HttpRequest, HttpResponse, web};
 use bytes::Bytes;
@@ -317,4 +317,625 @@ impl Service<ServiceRequest> for ErrorService {
     fn call(&self, _request: ServiceRequest) -> Self::Future {
         std::future::ready(Err(Error::from(io::Error::other("upstream down"))))
     }
+}
+
+// --- the newly wired stage surface (the reference pipeline checks) ---
+
+/// An inner service that always answers `404` (the return-rule surface).
+#[derive(Clone)]
+struct NotFoundService;
+
+impl Service<ServiceRequest> for NotFoundService {
+    type Response = ServiceResponse;
+    type Error = Error;
+    type Future = Ready<Result<ServiceResponse, Error>>;
+
+    fn poll_ready(&self, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&self, request: ServiceRequest) -> Self::Future {
+        std::future::ready(Ok(request.into_response(HttpResponse::NotFound().finish())))
+    }
+}
+
+use actix_guard_rs::{
+    CloudProviderStage, CustomChecksStage, EmergencyModeStage, GeoStage, GuardService,
+    HeadersAuthStage, HttpsEnforcementStage, IpBanConfig, IpBanManager, ReferrerStage,
+    ResponseProcessor, RouteGuard, SecurityHeadersConfig, TimeWindowStage, UserAgentStage,
+    UserAgentStageConfig,
+};
+use guard_core_engine::behavior::BehaviorRule;
+use guard_core_engine::cors::CorsConfig;
+use guard_core_engine::custom_checks::{
+    CustomRequestContext as ActixValidatorContext, CustomResponse,
+    CustomValidatorFn as ActixValidatorFn, ValidatorAnswer,
+};
+use guard_core_engine::geo::GeoIpHandler;
+use guard_core_engine::geo::parse_country_lists;
+use guard_core_engine::headers_auth::{HeaderAuthRules, REQUIRED_SENTINEL, RequiredHeader};
+use guard_core_engine::ip_ban::ThreatBanEntry;
+use guard_core_rs::cloud_provider::{
+    CloudIpTable, CloudProviderStageConfig, parse_cloud_selectors,
+};
+use guard_core_rs::geo::GeoStageConfig;
+use guard_core_rs::https_enforcement::HttpsEnforcementStageConfig;
+use guard_core_rs::route_gates::GateConfig;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+
+/// A GET request attributed to `ip` (the peer address the guard reads).
+fn attributed_get(path: &str, ip: &str) -> ServiceRequest {
+    TestRequest::get()
+        .uri(path)
+        .peer_addr(SocketAddr::from((
+            IpAddr::from_str(ip).expect("test ip"),
+            45_000,
+        )))
+        .to_srv_request()
+}
+
+async fn status_of<S>(guard: &GuardService<S>, request: ServiceRequest) -> (StatusCode, String)
+where
+    S: Service<ServiceRequest, Response = ServiceResponse, Error = Error> + 'static,
+{
+    let response = guard.call(request).await.expect("response");
+    let status = response.status();
+    let body = body_text(response).await;
+    (status, body)
+}
+
+#[actix_web::test]
+async fn emergency_mode_blocks_outside_the_whitelist_and_fails_secure_without_an_ip() {
+    let stage = EmergencyModeStage::builder(
+        guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
+    )
+    .emergency_mode(true)
+    .emergency_whitelist(["203.0.113.9"])
+    .build()
+    .expect("valid whitelist");
+    let guard = GuardTransform::new(default_config())
+        .with_emergency_mode(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, body) = status_of(&guard, get("/api")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, "Service temporarily unavailable");
+
+    let (status, _) = status_of(&guard, attributed_get("/api", "203.0.113.9")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn https_enforcement_redirects_plain_http() {
+    let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+        .enforce_https(true)
+        .build()
+        .expect("valid");
+    let guard = GuardTransform::new(default_config())
+        .with_https_enforcement(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let request = TestRequest::get()
+        .uri("/private?token=1")
+        .insert_header(("host", "guard.example"))
+        .to_srv_request();
+    let response = guard.call(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCATION)
+            .expect("location")
+            .to_str()
+            .expect("ascii"),
+        "https://guard.example/private?token=1"
+    );
+}
+
+#[actix_web::test]
+async fn required_headers_and_authentication_answer_the_reference_shapes() {
+    let stage = HeadersAuthStage::new(
+        None,
+        Arc::new(|path: &str| {
+            (path == "/private").then(|| {
+                Arc::new(RouteGuard {
+                    rules: HeaderAuthRules {
+                        required_headers: vec![RequiredHeader {
+                            name: String::from("x-api-key"),
+                            expected: String::from(REQUIRED_SENTINEL),
+                        }],
+                        auth_required: Some(String::from("bearer")),
+                        ..HeaderAuthRules::default()
+                    },
+                    verifier: Some(Arc::new(|credential: &str| credential == "let-me-in")),
+                    api_key_verifier: None,
+                })
+            })
+        }),
+    );
+    let guard = GuardTransform::new(default_config())
+        .with_headers_auth(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, _) = status_of(&guard, get("/private")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let request = TestRequest::get()
+        .uri("/private")
+        .insert_header(("x-api-key", "present"))
+        .insert_header(("authorization", "Bearer nope"))
+        .to_srv_request();
+    let (status, body) = status_of(&guard, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, "Authentication required");
+
+    let request = TestRequest::get()
+        .uri("/private")
+        .insert_header(("x-api-key", "present"))
+        .insert_header(("authorization", "Bearer let-me-in"))
+        .to_srv_request();
+    let (status, _) = status_of(&guard, request).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn referrer_gate_blocks_a_missing_or_foreign_referrer() {
+    let stage = ReferrerStage::builder(GateConfig::default())
+        .resolver(Arc::new(|path: &str| {
+            (path == "/gated").then(|| vec![String::from("https://good.example")])
+        }))
+        .build();
+    let guard = GuardTransform::new(default_config())
+        .with_referrer_gate(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, body) = status_of(&guard, get("/gated")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "Referrer required");
+
+    let request = TestRequest::get()
+        .uri("/gated")
+        .insert_header(("referer", "https://good.example/page"))
+        .to_srv_request();
+    let (status, _) = status_of(&guard, request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = TestRequest::get()
+        .uri("/gated")
+        .insert_header(("referer", "https://evil.example/page"))
+        .to_srv_request();
+    let (status, body) = status_of(&guard, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "Invalid referrer");
+}
+
+#[actix_web::test]
+async fn custom_validators_block_with_the_validator_response() {
+    let stage = CustomChecksStage::builder()
+        .validators_resolver(Arc::new(|path: &str| {
+            (path == "/private").then(|| {
+                vec![(
+                    String::from("post_only"),
+                    Arc::new(|ctx: &ActixValidatorContext<'_>| {
+                        (ctx.method != "POST").then_some(ValidatorAnswer::Response(
+                            CustomResponse { status: Some(403) },
+                        ))
+                    }) as ActixValidatorFn,
+                )]
+            })
+        }))
+        .build();
+    let guard = GuardTransform::new(default_config())
+        .with_custom_checks(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, _) = status_of(&guard, get("/private")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = status_of(&guard, post("/private", "{}")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn time_window_gate_blocks_outside_the_window() {
+    // The window is computed from the live clock so the test is
+    // deterministic: the gate closes for everything except a two-minute
+    // band that starts two minutes from now.
+    let now = chrono::Utc::now();
+    let start = (now + chrono::Duration::minutes(2))
+        .format("%H:%M")
+        .to_string();
+    let end = (now + chrono::Duration::minutes(3))
+        .format("%H:%M")
+        .to_string();
+    let stage = TimeWindowStage::builder(GateConfig::default())
+        .resolver(Arc::new(move |path: &str| {
+            (path == "/nightly").then(|| guard_core_engine::time_window::TimeWindow {
+                start: Some(start.clone()),
+                end: Some(end.clone()),
+                timezone: Some(String::from("UTC")),
+            })
+        }))
+        .build();
+    let guard = GuardTransform::new(default_config())
+        .with_time_window_gate(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, body) = status_of(&guard, get("/nightly")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "Access not allowed at this time");
+
+    let (status, _) = status_of(&guard, get("/open")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A hand-written resolver: every address resolves to `US`.
+struct UnitedStates;
+
+impl GeoIpHandler for UnitedStates {
+    fn get_country(&self, _ip: std::net::IpAddr) -> Option<String> {
+        Some(String::from("US"))
+    }
+}
+
+#[actix_web::test]
+async fn geo_country_blocking_answers_the_reference_403() {
+    let stage = GeoStage::new(GeoStageConfig {
+        gate: parse_country_lists(Vec::<String>::new(), ["US"]),
+        handler: Some(Arc::new(UnitedStates)),
+        passive_mode: false,
+    });
+    let guard = GuardTransform::new(default_config())
+        .with_geo_blocking(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, body) = status_of(&guard, attributed_get("/api", "192.0.2.9")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "Forbidden");
+}
+
+#[actix_web::test]
+async fn cloud_provider_blocking_answers_the_reference_403() {
+    let table = CloudIpTable::default();
+    table
+        .set_provider_ranges("AWS", vec![(String::from("192.0.2.0/24"), None)])
+        .expect("valid ranges");
+    let stage = CloudProviderStage::new(CloudProviderStageConfig {
+        block_cloud_providers: parse_cloud_selectors(["AWS"]).expect("valid selectors"),
+        table,
+        passive_mode: false,
+    });
+    let guard = GuardTransform::new(default_config())
+        .with_cloud_provider(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, body) = status_of(&guard, attributed_get("/api", "192.0.2.9")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "Cloud provider IP not allowed");
+
+    let (status, _) = status_of(&guard, attributed_get("/api", "198.51.100.9")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn user_agent_blocking_answers_the_reference_403() {
+    let stage = UserAgentStage::new(UserAgentStageConfig {
+        blocked_user_agents: guard_core_rs::user_agent::UserAgentFilter::new(["bad-bot"])
+            .expect("valid patterns"),
+        ..UserAgentStageConfig::default()
+    })
+    .expect("valid config");
+    let guard = GuardTransform::new(default_config())
+        .with_user_agent(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let request = TestRequest::get()
+        .uri("/api")
+        .insert_header(("user-agent", "bad-bot/1.0"))
+        .to_srv_request();
+    let (status, body) = status_of(&guard, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "User-Agent not allowed");
+
+    let request = TestRequest::get()
+        .uri("/api")
+        .insert_header(("user-agent", "friendly-crawler/2.0"))
+        .to_srv_request();
+    let (status, _) = status_of(&guard, request).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn custom_request_blocks_with_the_function_response() {
+    let stage = CustomChecksStage::builder()
+        .custom_request(
+            "maintenance_gate",
+            Arc::new(|ctx| (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })),
+        )
+        .build();
+    let guard = GuardTransform::new(default_config())
+        .with_custom_checks(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, _) = status_of(&guard, get("/admin")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let (status, _) = status_of(&guard, get("/public")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn response_processor_renders_security_headers_and_cors_on_every_response() {
+    let processor = ResponseProcessor::new(
+        Some(SecurityHeadersConfig::reference_default()),
+        Some(CorsConfig {
+            enabled: true,
+            allow_origins: vec![String::from("https://app.example.com")],
+            ..CorsConfig::default()
+        }),
+        Vec::new(),
+        Arc::new(Mutex::new(
+            guard_core_engine::behavior::BehaviorTracker::new(),
+        )),
+        IpBanManager::new(),
+        true,
+        262_144,
+        false,
+    );
+    let guard = GuardTransform::new(default_config())
+        .with_response_processor(processor)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let request = TestRequest::get()
+        .uri("/api")
+        .insert_header(("origin", "https://app.example.com"))
+        .to_srv_request();
+    let response = guard.call(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-content-type-options")
+            .expect("nosniff"),
+        "nosniff"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .expect("cors"),
+        "https://app.example.com"
+    );
+
+    // Block answers carry the set too (headers on blocked + passthrough).
+    let response = guard
+        .call(post("/api/comment", "<script>alert(1)</script>"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get("x-frame-options").expect("frame"),
+        "SAMEORIGIN"
+    );
+}
+
+#[actix_web::test]
+async fn a_return_pattern_rule_bans_at_the_threshold_through_the_fused_pipeline() {
+    // The processor's return rules share the transform's ban store: a
+    // crossed `status:404` ban rule answers the next request with the
+    // bans arm's 403 ("IP address banned"), the reference's
+    // behavioral-violation path.
+    let bans = IpBanManager::new();
+    let processor = ResponseProcessor::new(
+        None,
+        None,
+        vec![BehaviorRule {
+            rule_type: String::from("return_pattern"),
+            threshold: 2,
+            window: 3600,
+            pattern: String::from("status:404"),
+            action: String::from("ban"),
+            ban_duration: Some(900),
+            correlate_with_detection: false,
+        }],
+        Arc::new(Mutex::new(
+            guard_core_engine::behavior::BehaviorTracker::new(),
+        )),
+        bans.clone(),
+        true,
+        262_144,
+        false,
+    );
+    // The inner service answers 404: the return-rule surface the test
+    // drives.
+    let guard = GuardTransform::new(default_config())
+        .with_ip_banning(
+            bans.clone(),
+            IpBanConfig::new(true, 10, 3600, Vec::<(String, ThreatBanEntry)>::new())
+                .expect("valid"),
+        )
+        .with_response_processor(processor)
+        .new_transform(NotFoundService)
+        .await
+        .expect("transform");
+
+    // Two 404s track; the third trips the rule and bans the IP.
+    for _ in 0..3 {
+        let response = guard
+            .call(attributed_get("/missing", "192.0.2.41"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    assert!(
+        bans.is_banned(IpAddr::from_str("192.0.2.41").expect("ip")),
+        "the ban landed in the shared store"
+    );
+
+    // The next request answers from the bans arm.
+    let (status, body) = status_of(&guard, attributed_get("/missing", "192.0.2.41")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "IP address banned");
+}
+
+#[actix_web::test]
+async fn https_enforcement_host_forms_feed_the_trusted_proxy_comparison() {
+    let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+        .enforce_https(true)
+        .build()
+        .expect("valid");
+    let guard = GuardTransform::new(default_config())
+        .with_https_enforcement(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    // A host header with a port: the redirect target keeps the host as
+    // sent; the port strip feeds the trusted-proxy comparison only.
+    let request = TestRequest::get()
+        .uri("/private")
+        .insert_header(("host", "guard.example:8443"))
+        .to_srv_request();
+    let response = guard.call(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCATION)
+            .expect("location")
+            .to_str()
+            .expect("ascii"),
+        "https://guard.example:8443/private"
+    );
+
+    // A bracketed IPv6 host survives verbatim in the target.
+    let request = TestRequest::get()
+        .uri("/private")
+        .insert_header(("host", "[2001:db8::1]:8443"))
+        .to_srv_request();
+    let response = guard.call(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCATION)
+            .expect("location")
+            .to_str()
+            .expect("ascii"),
+        "https://[2001:db8::1]:8443/private"
+    );
+}
+
+#[actix_web::test]
+async fn request_logging_stage_composes_and_never_blocks() {
+    let stage =
+        actix_guard_rs::RequestLoggingStage::new(actix_guard_rs::RequestLoggingStageConfig {
+            log_request_level: Some(guard_core_rs::logging::LogLevel::Info),
+            ..actix_guard_rs::RequestLoggingStageConfig::default()
+        });
+    assert!(stage.exists(), "the reference construction gate");
+    let guard = GuardTransform::new(default_config())
+        .with_request_logging(stage)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+
+    let (status, _) = status_of(&guard, attributed_get("/api", "192.0.2.9")).await;
+    assert_eq!(status, StatusCode::OK, "the logging stage never blocks");
+
+    // An attack still blocks through the same pipeline.
+    let (status, body) = status_of(&guard, post("/api/comment", "<script>alert(1)</script>")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, BLOCKED_MESSAGE);
+}
+
+#[actix_web::test]
+async fn geo_cloud_and_user_agent_blocks_resolve_the_answer_body() {
+    use guard_core_rs::geo::{GeoStage, GeoStageConfig, parse_country_lists};
+    struct UnitedStates;
+    impl GeoIpHandler for UnitedStates {
+        fn get_country(&self, _ip: std::net::IpAddr) -> Option<String> {
+            Some(String::from("US"))
+        }
+    }
+
+    let geo = GeoStage::new(GeoStageConfig {
+        gate: parse_country_lists(Vec::<String>::new(), ["US"]),
+        handler: Some(Arc::new(UnitedStates)),
+        passive_mode: false,
+    });
+    let guard = GuardTransform::new(default_config())
+        .with_geo_blocking(geo)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+    let (status, body) = status_of(&guard, attributed_get("/api", "192.0.2.9")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        body, "Forbidden",
+        "the geo answer body via stage_answer_body"
+    );
+
+    let table = CloudIpTable::default();
+    table
+        .set_provider_ranges("AWS", vec![(String::from("192.0.2.0/24"), None)])
+        .expect("valid ranges");
+    let cloud =
+        CloudProviderStage::builder(guard_core_rs::cloud_provider::CloudProviderStageConfig {
+            block_cloud_providers: parse_cloud_selectors(["AWS"]).expect("valid selectors"),
+            table,
+            passive_mode: false,
+        })
+        .build();
+    let guard = GuardTransform::new(default_config())
+        .with_cloud_provider(cloud)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+    let (status, body) = status_of(&guard, attributed_get("/api", "192.0.2.9")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "Cloud provider IP not allowed");
+
+    let ua = UserAgentStage::new(UserAgentStageConfig {
+        blocked_user_agents: guard_core_rs::user_agent::UserAgentFilter::new(["bad-bot"])
+            .expect("valid patterns"),
+        ..UserAgentStageConfig::default()
+    })
+    .expect("valid config");
+    let guard = GuardTransform::new(default_config())
+        .with_user_agent(ua)
+        .new_transform(EchoService)
+        .await
+        .expect("transform");
+    let request = TestRequest::get()
+        .uri("/api")
+        .insert_header(("user-agent", "bad-bot/1.0"))
+        .to_srv_request();
+    let (status, body) = status_of(&guard, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "User-Agent not allowed");
 }

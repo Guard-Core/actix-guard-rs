@@ -34,10 +34,14 @@ guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", versio
 guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.3.1" }
 
 [dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 actix-web = { version = "4", features = ["macros"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+# cargo-llvm-cov sets cfg(coverage) during coverage builds; declare it so the
+# cfg(not(coverage)) pairs in the sources stay lint-clean.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [lints.clippy]
 all                     = { level = "deny", priority = -1 }

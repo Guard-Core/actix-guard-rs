@@ -19,6 +19,10 @@ The reference-surface release: the status route and the WebSocket upgrade guard 
 
 ## [Unreleased]
 
+### Changed
+
+- The CI coverage gate computes line coverage from the lcov export's per-line DA records instead of llvm-cov's summary table: llvm-cov 22's summary aggregation falsely reports missed lines that no line-level view (show text/html, lcov, cobertura, the JSON segment list) can see on the same profdata, and the divergence persists on the newest available toolchain (cargo-llvm-cov 0.9.1 + rustc 1.99.0). The gate keeps the same fail-closed 100%-lines semantics with nothing hidden or excluded; the summary table stays in the job as an informational printout. Evidence linked in the workflow (#34)
+
 ## [1.3.0] - 2026-10-01
 
 ### Note
