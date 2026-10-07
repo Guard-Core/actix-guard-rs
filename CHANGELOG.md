@@ -2,6 +2,17 @@
 
 All notable changes to this project.
 
+## [1.4.0] - 2026-10-07
+
+### Note
+
+- Trains with the engine: the `guard-core-engine` and `guard-core-rs` floors move to 4.3.1 (the parity-completion release)
+
+### Added
+
+- The reference status route (fastapi-guard `add_status_route` + `HandlerInitializer.get_initialization_status`): `GuardStatus` mounts at `/_guard/status` as an `HttpServiceFactory`, serving the cloud-provider readiness table and the geo-ip component from the handles the app already holds (#35)
+- The WebSocket upgrade guard (`WebSocketGuard` transform): the reference upgrade sequence (fail-secure unknown address, `is_ip_banned`, the `is_ip_allowed` gate + country arms, the ws rate limit, the path/query/header penetration scan) runs before the handshake, rejecting with `403` pre-accept plus the `1008`/`1013` close shapes on dedicated headers (#35)
+
 ## [Unreleased]
 
 ## [1.3.0] - 2026-10-01
