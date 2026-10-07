@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "actix-guard-rs"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "actix-web",
  "bytes",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-engine"
-version = "4.3.0"
+version = "4.3.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-rs"
-version = "4.3.0"
+version = "4.3.1"
 dependencies = [
  "chrono",
  "guard-core-engine",
@@ -682,6 +682,7 @@ dependencies = [
  "http 1.5.0",
  "regex",
  "serde_json",
+ "sha2",
  "tower",
  "ureq",
 ]

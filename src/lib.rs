@@ -175,6 +175,9 @@
 mod response;
 mod service;
 
+pub mod status;
+pub mod websocket;
+
 use actix_web::Error;
 use actix_web::body::MessageBody;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
