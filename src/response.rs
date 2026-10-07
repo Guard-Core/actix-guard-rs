@@ -27,10 +27,6 @@ pub const OVERSIZE_MESSAGE: &str = "Payload too large";
 /// Detail message carried by the fail-secure `500` response.
 pub const FAILURE_MESSAGE: &str = "Security check failed";
 
-pub(crate) fn forbidden(request: HttpRequest) -> ServiceResponse {
-    plain_text(request, StatusCode::FORBIDDEN, FORBIDDEN_MESSAGE)
-}
-
 pub(crate) fn oversize(request: HttpRequest) -> ServiceResponse {
     plain_text(request, StatusCode::PAYLOAD_TOO_LARGE, OVERSIZE_MESSAGE)
 }
@@ -146,7 +142,7 @@ mod tests {
 
     #[test]
     fn forbidden_response_shape() {
-        let response = forbidden(test_request());
+        let response = blocked_with_body(test_request(), 403, FORBIDDEN_MESSAGE);
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             response

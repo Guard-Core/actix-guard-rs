@@ -128,6 +128,24 @@ where
             let (request, payload) = request.into_parts();
             let facts = request_facts(&request);
 
+            // The reference `exclude_paths` carve-out runs first: the
+            // docs/static paths bypass the whole pipeline (exact path
+            // match), detection included.
+            if transform.exclude_paths.contains(&facts.path) {
+                let rebuilt = ServiceRequest::from_parts(request, payload);
+                let mut forwarded = next
+                    .call(rebuilt)
+                    .await
+                    .map(ServiceResponse::map_into_boxed_body)?;
+                run_response_processor(
+                    &transform,
+                    &facts,
+                    forwarded.status().as_u16(),
+                    forwarded.response_mut(),
+                );
+                return Ok(forwarded);
+            }
+
             // The IP gate runs before anything else: a denied IP must not
             // cost a body buffer, and detection still scans whatever passes.
             if let Some(response) = enforce_ip_gate(&request, &transform) {
@@ -668,12 +686,16 @@ fn compute_processor_headers(
 /// Apply the configured IP gate to the request.
 ///
 /// Returns the `403 Forbidden` response when the gate denies the request IP
-/// (the request's peer address). A passed request gets the gate's
-/// [`IpGateDecision`] inserted into the request extensions (the family-local
-/// skip state, the equivalent of the reference engine's `state.is_whitelisted`
-/// / `state.is_exempt`) so downstream handlers can read it. Without a gate or
-/// without a peer address the request is not attributed: the gate does not
-/// run, and nothing is inserted.
+/// (the request's peer address), rendering the reference `ip_filter` behavior
+/// end to end: passive mode logs the crossing and forwards (no gate decision
+/// reaches the rest of the pipeline, so the unattributed handling applies),
+/// the `on_block` hook fires once with the reference payload keys, and the
+/// custom-error body override wins over the family default. A passed request
+/// gets the gate's [`IpGateDecision`] inserted into the request extensions
+/// (the family-local skip state, the equivalent of the reference engine's
+/// `state.is_whitelisted` / `state.is_exempt`) so downstream handlers can
+/// read it. Without a gate or without a peer address the request is not
+/// attributed: the gate does not run, and nothing is inserted.
 fn enforce_ip_gate(request: &HttpRequest, transform: &GuardTransform) -> Option<ServiceResponse> {
     let gate = transform.ip_gate()?;
     let peer = request.peer_addr()?;
@@ -682,7 +704,33 @@ fn enforce_ip_gate(request: &HttpRequest, transform: &GuardTransform) -> Option<
             request.extensions_mut().insert(decision);
             None
         }
-        IpGateVerdict::Denied(_) => Some(response::forbidden(request.clone())),
+        IpGateVerdict::Denied(denial) => {
+            if transform.passive_mode {
+                return None;
+            }
+            let ip_string = peer.ip().to_string();
+            let body = resolve_error_body(
+                transform.custom_error_responses(),
+                403,
+                response::FORBIDDEN_MESSAGE,
+            );
+            if let Some(observability) = transform.observability() {
+                let observation = request_observation(request);
+                let payload = build_block_payload(
+                    "ip_security",
+                    &format!("IP address blocked: {ip_string}"),
+                    denial.reason(),
+                    false,
+                    &ip_string,
+                    observation.url.as_deref().unwrap_or("/"),
+                    observation.method.as_deref().unwrap_or(""),
+                    Some(403),
+                    &observability.sensitive,
+                );
+                fire_block_hook(transform.on_block(), &payload);
+            }
+            Some(block_response(request, transform, 403, &body))
+        }
     }
 }
 
@@ -2556,5 +2604,404 @@ mod tests {
             .to_srv_request();
         let response = guard.call(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // --- the unified SecurityConfig consumption (from_security_config) ---
+    use crate::{
+        GuardConfigError, IpBanConfigError, IpGateError, RateLimitConfigError, UserAgentConfigError,
+    };
+    use guard_core_engine::security_config::SecurityConfig;
+    use guard_core_rs::responses::OnBlockHook;
+
+    fn config_request(ip: &str, uri: &str) -> ServiceRequest {
+        TestRequest::get()
+            .uri(uri)
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str(ip).expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request()
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_defaults_screen_clean_traffic() {
+        let config = SecurityConfig::default();
+        let (status, _) = status_body(
+            GuardTransform::from_security_config(&config).expect("valid config"),
+            config_request("203.0.113.9", "/hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_enforce_https_redirects_http() {
+        let config = SecurityConfig {
+            enforce_https: true,
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let request = TestRequest::get()
+            .uri("/hello")
+            .insert_header(("host", "guard.example"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("203.0.113.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (status, body, _) = full_status(transform, request).await;
+        assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+        assert!(body.is_empty(), "the reference redirect carries no body");
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_emergency_mode_blocks_outside_the_whitelist() {
+        let config = SecurityConfig {
+            emergency_mode: true,
+            emergency_whitelist: vec![String::from("198.51.100.7")],
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let (blocked, _) =
+            status_body(transform.clone(), config_request("203.0.113.9", "/hello")).await;
+        assert_eq!(blocked, StatusCode::SERVICE_UNAVAILABLE);
+        let (allowed, _) = status_body(transform, config_request("198.51.100.7", "/hello")).await;
+        assert_eq!(allowed, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_blocked_user_agent_answers_the_403() {
+        let config = SecurityConfig {
+            blocked_user_agents: vec![String::from("bad-bot")],
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let request = TestRequest::get()
+            .uri("/hello")
+            .insert_header(("user-agent", "bad-bot/1.0"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("203.0.113.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (blocked, body, _) = full_status(transform, request).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+        assert_eq!(body, "User-Agent not allowed");
+
+        let (allowed, _) = status_body(
+            GuardTransform::from_security_config(&config).expect("valid config"),
+            config_request("203.0.113.9", "/hello"),
+        )
+        .await;
+        assert_eq!(allowed, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_exclude_paths_bypass_the_pipeline() {
+        let config = SecurityConfig {
+            blacklist: vec![String::from("203.0.113.9")],
+            exclude_paths: vec![String::from("/docs")],
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        // An excluded path bypasses every check, gate included: the
+        // blacklisted IP forwards on /docs.
+        let (bypassed, _) =
+            status_body(transform.clone(), config_request("203.0.113.9", "/docs")).await;
+        assert_eq!(bypassed, StatusCode::OK);
+        // Any other path takes the gate denial.
+        let (blocked, _) = status_body(transform, config_request("203.0.113.9", "/hello")).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_exclude_paths_still_render_the_response_pass() {
+        let config = SecurityConfig::default();
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let (status, _, _) = full_status(transform, config_request("203.0.113.9", "/docs")).await;
+        assert_eq!(status, StatusCode::OK);
+        // The forwarded response still carries the security-header set: the
+        // carve-out bypasses the request-side checks, not the response pass.
+        let guard =
+            guarded(GuardTransform::from_security_config(&config).expect("valid config")).await;
+        let response = guard
+            .call(config_request("203.0.113.9", "/docs"))
+            .await
+            .expect("response");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-content-type-options")
+                .map(|value| value.to_str().expect("ascii")),
+            Some("nosniff")
+        );
+    }
+
+    #[test]
+    fn from_security_config_invalid_ip_list_entry_fails_closed() {
+        let config = SecurityConfig {
+            whitelist: Some(vec![String::from("not-an-ip")]),
+            ..SecurityConfig::default()
+        };
+        let error = GuardTransform::from_security_config(&config).unwrap_err();
+        assert!(matches!(error, GuardConfigError::IpGate(_)));
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_rate_limit_crossing_answers_429() {
+        let config = SecurityConfig {
+            rate_limit: 1,
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let (first, _, _) =
+            full_status(transform.clone(), config_request("203.0.113.9", "/hello")).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, body, retry_after) =
+            full_status(transform, config_request("203.0.113.9", "/hello")).await;
+        assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, crate::RATE_LIMITED_MESSAGE);
+        assert_eq!(retry_after.as_deref(), Some("60"));
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_custom_error_responses_render() {
+        let config = SecurityConfig {
+            blacklist: vec![String::from("203.0.113.9")],
+            custom_error_responses: {
+                let mut map = std::collections::BTreeMap::new();
+                map.insert(403, String::from("custom-forbidden"));
+                map
+            },
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let (status, body, _) =
+            full_status(transform, config_request("203.0.113.9", "/hello")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // The custom-error body override wins over the family default.
+        assert_eq!(body, "custom-forbidden");
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_ip_gate_denial_fires_the_on_block_hook() {
+        type HookLog = Arc<Mutex<Vec<(String, Option<u16>)>>>;
+        let seen: HookLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let hook: OnBlockHook =
+            Arc::new(move |payload: &guard_core_rs::responses::BlockPayload| {
+                sink.lock()
+                    .expect("sink")
+                    .push((payload.check_name.clone(), payload.status_code));
+            });
+        let config = SecurityConfig {
+            blacklist: vec![String::from("203.0.113.9")],
+            on_block: Some(hook),
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let (status, body, _) =
+            full_status(transform, config_request("203.0.113.9", "/hello")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, FORBIDDEN_MESSAGE);
+        let seen = seen.lock().expect("sink");
+        assert!(
+            seen.iter()
+                .any(|(check, status)| check == "ip_security" && *status == Some(403)),
+            "the reference on_block hook fires once with the ip_security keys: {seen:?}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_ip_gate_denial_under_passive_mode_forwards() {
+        let config = SecurityConfig {
+            passive_mode: true,
+            blacklist: vec![String::from("203.0.113.9")],
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let (status, _) = status_body(transform, config_request("203.0.113.9", "/hello")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_disabled_rate_limiting_forwards_freely() {
+        let config = SecurityConfig {
+            enable_rate_limiting: false,
+            rate_limit: 1,
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        for _ in 0..3 {
+            let (status, _) =
+                status_body(transform.clone(), config_request("203.0.113.9", "/hello")).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    #[test]
+    fn from_security_config_zero_rate_limit_fails_closed() {
+        let config = SecurityConfig {
+            rate_limit: 0,
+            ..SecurityConfig::default()
+        };
+        let error = GuardTransform::from_security_config(&config).unwrap_err();
+        assert!(matches!(error, GuardConfigError::RateLimit(_)));
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_detection_exclusions_and_categories_reach_the_scan() {
+        let config = SecurityConfig {
+            enabled_detection_categories: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("xss"));
+                set
+            },
+            excluded_detection_params: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("q"));
+                set
+            },
+            detection_scan_body: false,
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        // The sqli category is disabled by the enabled-categories override:
+        // the sqli probe forwards.
+        let (status, _) = status_body(
+            transform,
+            config_request("203.0.113.9", "/hello?q=1%27+OR+1%3D1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_security_headers_and_cors_render() {
+        let config = SecurityConfig {
+            enable_cors: true,
+            cors_allow_origins: vec![String::from("https://app.test")],
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let guard = guarded(transform).await;
+        let request = TestRequest::get()
+            .uri("/hello")
+            .insert_header(("origin", "https://app.test"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("203.0.113.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let response = guard.call(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-content-type-options")
+                .map(|value| value.to_str().expect("ascii")),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .map(|value| value.to_str().expect("ascii")),
+            Some("https://app.test")
+        );
+    }
+
+    #[test]
+    fn from_security_config_empty_category_set_skips_the_exclusion_block() {
+        // The reference's empty `enabled_detection_categories` frozenset:
+        // an explicitly empty set disables every category, and the
+        // detection-exclusion block is not installed at all.
+        let config = SecurityConfig {
+            enabled_detection_categories: std::collections::BTreeSet::new(),
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        assert!(transform.detection_exclusions().is_none());
+    }
+
+    #[test]
+    fn from_security_config_silent_observability_skips_the_knob() {
+        let config = SecurityConfig {
+            log_suspicious_level: None,
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        assert!(transform.observability().is_none());
+    }
+
+    #[test]
+    fn from_security_config_disabled_security_headers_skip_the_processor() {
+        let config = SecurityConfig {
+            security_headers: guard_core_engine::security_headers::SecurityHeadersConfig {
+                enabled: false,
+                ..guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()
+            },
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        assert!(transform.response_processor().is_none());
+    }
+
+    #[test]
+    fn guard_config_error_display_and_source_cover_every_variant() {
+        let ip_gate: GuardConfigError = IpGateError {
+            list: "whitelist",
+            entry: String::from("nope"),
+        }
+        .into();
+        assert!(ip_gate.to_string().contains("ip list"));
+        assert!(std::error::Error::source(&ip_gate).is_some());
+
+        let rate_limit: GuardConfigError = RateLimitConfigError {
+            field: std::borrow::Cow::Borrowed("rate_limit"),
+            reason: "must be at least 1",
+        }
+        .into();
+        assert!(rate_limit.to_string().contains("rate limit"));
+        assert!(std::error::Error::source(&rate_limit).is_some());
+
+        let user_agent: GuardConfigError = UserAgentConfigError {
+            entry: String::from("bad-bot"),
+            reason: String::from("rejected"),
+        }
+        .into();
+        assert!(user_agent.to_string().contains("blocked user agent"));
+        assert!(std::error::Error::source(&user_agent).is_some());
+
+        let ban: GuardConfigError = IpBanConfigError::NonPositive {
+            field: "auto_ban_threshold",
+        }
+        .into();
+        assert!(ban.to_string().contains("ip ban"));
+        assert!(std::error::Error::source(&ban).is_some());
+    }
+
+    #[test]
+    fn map_log_level_covers_every_reference_level() {
+        assert!(matches!(
+            crate::map_log_level(guard_core_engine::security_config::LogLevel::Info),
+            guard_core_rs::logging::LogLevel::Info
+        ));
+        assert!(matches!(
+            crate::map_log_level(guard_core_engine::security_config::LogLevel::Debug),
+            guard_core_rs::logging::LogLevel::Debug
+        ));
+        assert!(matches!(
+            crate::map_log_level(guard_core_engine::security_config::LogLevel::Warning),
+            guard_core_rs::logging::LogLevel::Warning
+        ));
+        assert!(matches!(
+            crate::map_log_level(guard_core_engine::security_config::LogLevel::Error),
+            guard_core_rs::logging::LogLevel::Error
+        ));
+        assert!(matches!(
+            crate::map_log_level(guard_core_engine::security_config::LogLevel::Critical),
+            guard_core_rs::logging::LogLevel::Critical
+        ));
     }
 }
