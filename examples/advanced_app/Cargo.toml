@@ -8,7 +8,7 @@ description = "Production-shaped actix-guard-rs example service."
 
 [dependencies]
 actix-web = "4"
-actix-guard-rs = { path = "../..", version = "1.3.0" }
+actix-guard-rs = { path = "../..", version = "1.4.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]
