@@ -173,15 +173,16 @@ where
             // cost a body buffer, and detection still scans whatever
             // passes. The reference `ip_security` bypass skips the gate
             // (and the ban/geo arms below, the fused `ip_security` block).
-            if !bypassed("ip_security")
+            if !bypassed("ip")
                 && let Some(response) = enforce_ip_gate(&request, &transform)
             {
                 return Ok(finish_generated(&request, &transform, response));
             }
 
-            // Check 2: emergency mode (503 outside the whitelist).
-            if !bypassed("emergency_mode")
-                && let Some(stage) = transform.emergency_mode()
+            // Check 2: emergency mode (503 outside the whitelist). The
+            // reference pipeline never consults the bypass set here: the
+            // global stage is not route-bypassable.
+            if let Some(stage) = transform.emergency_mode()
                 && let Some(answer) = stage.decide(
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
                     &facts.ip_string,
@@ -200,7 +201,7 @@ where
             // The route's `require_https` rides the same stage (the
             // carrier lane), so the trust knobs and the passive handling
             // match the global arm.
-            if !bypassed("https_enforcement") {
+            {
                 let https_url = format!(
                     "https://{}{}{}",
                     facts.host.as_deref().unwrap_or_default(),
@@ -209,14 +210,24 @@ where
                 );
                 let route_require_https = route.is_some_and(|route| route.require_https);
                 let answer = if let Some(stage) = transform.https_enforcement() {
-                    stage.decide_route(
-                        &facts.path,
-                        &facts.scheme,
-                        facts.host.as_deref().map(host_of_authority),
-                        facts.x_forwarded_proto.as_deref(),
-                        &https_url,
-                        route_require_https.then_some(true),
-                    )
+                    if let Some(route) = route {
+                        stage.decide_route(
+                            &facts.path,
+                            &facts.scheme,
+                            facts.host.as_deref().map(host_of_authority),
+                            facts.x_forwarded_proto.as_deref(),
+                            &https_url,
+                            Some(route.require_https),
+                        )
+                    } else {
+                        stage.decide(
+                            &facts.path,
+                            &facts.scheme,
+                            facts.host.as_deref().map(host_of_authority),
+                            facts.x_forwarded_proto.as_deref(),
+                            &https_url,
+                        )
+                    }
                 } else if route_require_https && facts.scheme != "https" && !transform.passive_mode
                 {
                     Some(guard_core_rs::https_enforcement::HttpsRedirectAnswer {
@@ -237,9 +248,7 @@ where
 
             // Check 4: request logging (compose-only, never blocks; the
             // composed line is the host's to emit).
-            if !bypassed("request_logging")
-                && let Some(stage) = transform.request_logging()
-            {
+            if let Some(stage) = transform.request_logging() {
                 let _ = stage.compose(
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
                     Some(&facts.method),
@@ -278,9 +287,7 @@ where
             // Checks 6 + 7: required headers, then authentication (the
             // fused stage answers for both; bypassing either reference
             // check skips the whole stage).
-            if !(bypassed("required_headers") || bypassed("authentication"))
-                && let Some(stage) = transform.headers_auth()
-            {
+            if let Some(stage) = transform.headers_auth() {
                 let pairs: Vec<(&str, &str)> = request
                     .headers()
                     .iter()
@@ -299,8 +306,7 @@ where
             }
 
             // Check 8: the route referrer gate.
-            if !bypassed("referrer")
-                && let Some(stage) = transform.referrer_gate()
+            if let Some(stage) = transform.referrer_gate()
                 && let Some(answer) = stage.decide(
                     &facts.path,
                     facts.referer.as_deref(),
@@ -319,12 +325,14 @@ where
 
             // Check 9: the route custom validators (first blocking
             // response wins, the validator's own shape).
-            if !bypassed("custom_validators")
-                && let Some(stage) = transform.custom_checks()
+            if let Some(stage) = transform.custom_checks()
                 && let Some(failure) = stage.decide_custom_validators(
                     &facts.path,
                     &facts.method,
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                    buffered
+                        .as_deref()
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok()),
                 )
             {
                 let status = failure.status.unwrap_or(200);
@@ -332,8 +340,7 @@ where
             }
 
             // Check 10: the route time-window gate.
-            if !bypassed("time_window")
-                && let Some(stage) = transform.time_window_gate()
+            if let Some(stage) = transform.time_window_gate()
                 && let Some(answer) =
                     stage.decide(&facts.path, &facts.ip_string, &facts.path, &facts.method)
             {
@@ -349,7 +356,7 @@ where
             // the pipeline stages that do. The reference
             // `suspicious_activity` bypass skips the scan (and with it the
             // violation feed) for the route.
-            let verdict = if bypassed("suspicious_activity") {
+            let verdict = if bypassed("penetration") {
                 None
             } else {
                 match scan_request(&request, buffered.as_ref(), &transform) {
@@ -381,7 +388,7 @@ where
                     trigger_info: verdict.reason.clone(),
                 });
             let observation = request_observation(&request);
-            if !bypassed("ip_security")
+            if !bypassed("ip_ban")
                 && let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation))
             {
                 return Ok(finish_generated(
@@ -391,9 +398,9 @@ where
                 ));
             }
 
-            // The reference runs the country arms inside `ip_security`:
-            // the same bypass skips the geo stage.
-            if !bypassed("ip_security")
+            // The reference runs the country arms inside the `ip`-gated
+            // block: the same bypass skips the geo stage.
+            if !bypassed("ip")
                 && let Some(stage) = transform.geo_blocking()
                 && let Some(decision) = stage.decide(facts.ip, facts.gate)
             {
@@ -405,7 +412,7 @@ where
                 ));
             }
 
-            if !bypassed("cloud_provider")
+            if !bypassed("clouds")
                 && let Some(stage) = transform.cloud_provider()
                 && let Some(decision) = stage.decide(facts.ip, facts.gate)
             {
@@ -417,7 +424,7 @@ where
                 ));
             }
 
-            if !bypassed("user_agent") {
+            {
                 // The route's `blocked_user_agents` runs additively before
                 // the global filter (the reference
                 // `check_user_agent_allowed` order); whitelisted and
@@ -540,12 +547,14 @@ where
             // Check 17: the global `custom_request` function (its own
             // response shape; a response without a status renders the
             // framework default 200).
-            if !bypassed("custom_request")
-                && let Some(stage) = transform.custom_checks()
+            if let Some(stage) = transform.custom_checks()
                 && let Some(answer) = stage.decide_custom_request(
                     &facts.method,
                     &facts.path,
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
+                    buffered
+                        .as_deref()
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok()),
                 )
             {
                 let status = answer.status.unwrap_or(200);
@@ -3165,11 +3174,11 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn the_route_bypass_skips_the_scan_for_its_path_only() {
+    async fn the_penetration_bypass_skips_the_scan_for_its_path_only() {
         let config = RouteConfig {
             bypassed_checks: {
                 let mut set = std::collections::BTreeSet::new();
-                set.insert(String::from("suspicious_activity"));
+                set.insert(String::from("penetration"));
                 set
             },
             ..RouteConfig::default()
@@ -3302,13 +3311,13 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn the_ip_security_bypass_skips_the_gate_for_its_route() {
+    async fn the_ip_bypass_skips_the_gate_for_its_route() {
         let gate = crate::IpGateConfig::new([] as [&str; 0], ["192.0.2.9"], [] as [&str; 0])
             .expect("valid lists");
         let config = RouteConfig {
             bypassed_checks: {
                 let mut set = std::collections::BTreeSet::new();
-                set.insert(String::from("ip_security"));
+                set.insert(String::from("ip"));
                 set
             },
             ..RouteConfig::default()
@@ -3328,78 +3337,6 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn the_route_bypass_skips_emergency_mode_for_its_path() {
-        let stage = guard_core_rs::emergency_mode::EmergencyModeStage::builder(
-            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
-        )
-        .emergency_mode(true)
-        .build()
-        .expect("valid stage");
-        let config = RouteConfig {
-            bypassed_checks: {
-                let mut set = std::collections::BTreeSet::new();
-                set.insert(String::from("emergency_mode"));
-                set
-            },
-            ..RouteConfig::default()
-        };
-        let transform = GuardTransform::new(default_config())
-            .with_emergency_mode(stage)
-            .with_route_configs(resolver_for(&[("GET", "/open")], config));
-        let (blocked, _) = status_body(
-            transform.clone(),
-            carrier_request("GET", "/locked", "192.0.2.9"),
-        )
-        .await;
-        assert_eq!(blocked, StatusCode::SERVICE_UNAVAILABLE);
-        let (open, _) = status_body(transform, carrier_request("GET", "/open", "192.0.2.9")).await;
-        assert_eq!(open, StatusCode::OK);
-    }
-
-    #[actix_web::test]
-    async fn the_user_agent_bypass_skips_both_lists_for_the_route() {
-        let config = RouteConfig {
-            blocked_user_agents: vec![String::from("route-bot")],
-            bypassed_checks: {
-                let mut set = std::collections::BTreeSet::new();
-                set.insert(String::from("user_agent"));
-                set
-            },
-            ..RouteConfig::default()
-        };
-        let stage = guard_core_rs::user_agent::UserAgentStage::builder(
-            guard_core_rs::user_agent::UserAgentStageConfig {
-                blocked_user_agents: guard_core_engine::user_agent::UserAgentFilter::new([
-                    "global-bot",
-                ])
-                .expect("valid patterns"),
-                ip_ban: guard_core_engine::ip_ban::IpBanConfig {
-                    enable_ip_banning: false,
-                    ..guard_core_engine::ip_ban::IpBanConfig::default()
-                },
-                passive_mode: false,
-            },
-        )
-        .build()
-        .expect("valid stage");
-        let transform = GuardTransform::new(default_config())
-            .with_user_agent(stage)
-            .with_route_configs(resolver_for(&[("GET", "/api")], config));
-        // Both the route list and the global list are skipped on the
-        // bypassed route.
-        let request = TestRequest::get()
-            .uri("/api")
-            .insert_header(("user-agent", "route-bot"))
-            .peer_addr(std::net::SocketAddr::new(
-                IpAddr::from_str("192.0.2.9").expect("test ip"),
-                45_000,
-            ))
-            .to_srv_request();
-        let (open, _) = status_body(transform, request).await;
-        assert_eq!(open, StatusCode::OK);
-    }
-
-    #[actix_web::test]
     async fn a_non_compilable_route_pattern_fails_secure() {
         let config = RouteConfig {
             blocked_user_agents: vec![String::from("([")],
@@ -3414,41 +3351,31 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn the_https_enforcement_bypass_skips_both_arms_for_the_route() {
+    async fn route_require_https_rides_the_installed_stage_lane() {
+        let config = RouteConfig {
+            require_https: true,
+            ..RouteConfig::default()
+        };
         let stage = guard_core_rs::https_enforcement::HttpsEnforcementStage::builder(
-            guard_core_rs::https_enforcement::HttpsEnforcementStageConfig {
-                enforce_https: true,
-                trust_x_forwarded_proto: false,
-                passive_mode: false,
-            },
+            guard_core_rs::https_enforcement::HttpsEnforcementStageConfig::default(),
         )
         .build()
         .expect("valid stage");
-        let config = RouteConfig {
-            require_https: true,
-            bypassed_checks: {
-                let mut set = std::collections::BTreeSet::new();
-                set.insert(String::from("https_enforcement"));
-                set
-            },
-            ..RouteConfig::default()
-        };
         let transform = GuardTransform::new(default_config())
             .with_https_enforcement(stage)
-            .with_route_configs(resolver_for(&[("GET", "/plain")], config));
-        // Both the global arm and the route's require_https are skipped on
-        // the bypassed route.
+            .with_route_configs(resolver_for(&[("GET", "/tls")], config));
         let request = TestRequest::get()
-            .uri("/plain")
+            .uri("/tls")
             .insert_header(("host", "guard.example"))
             .peer_addr(std::net::SocketAddr::new(
                 IpAddr::from_str("192.0.2.9").expect("test ip"),
                 45_000,
             ))
             .to_srv_request();
-        let (plain, _, _) = full_status(transform.clone(), request).await;
-        assert_eq!(plain, StatusCode::OK);
-        // The global arm still answers next door.
+        let (status, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+        // An unlisted path passes (the global arm is off and the stage's
+        // resolver seam is not installed).
         let request = TestRequest::get()
             .uri("/other")
             .insert_header(("host", "guard.example"))
@@ -3457,7 +3384,7 @@ mod tests {
                 45_000,
             ))
             .to_srv_request();
-        let (redirect, _, _) = full_status(transform, request).await;
-        assert_eq!(redirect, StatusCode::MOVED_PERMANENTLY);
+        let (plain, _, _) = full_status(transform, request).await;
+        assert_eq!(plain, StatusCode::OK);
     }
 }
