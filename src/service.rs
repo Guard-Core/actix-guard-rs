@@ -13,6 +13,7 @@ use guard_core_engine::detection_exclusions::{
 };
 use guard_core_engine::ip_gate::IpGateDecision;
 use guard_core_engine::ip_gate::IpGateVerdict;
+use guard_core_engine::route_config::RouteConfig;
 use guard_core_rs::process_response::{RequestBits, ResponseBits};
 use guard_core_rs::responses::{build_block_payload, fire_block_hook, resolve_error_body};
 use guard_core_rs::tower::{RequestObservation, RouteRateLimits};
@@ -146,14 +147,41 @@ where
                 return Ok(forwarded);
             }
 
+            // The reference `RouteConfigResolver`: the carrier extension
+            // wins over the installed resolver (the app attaches the
+            // route's config directly, the reference
+            // `request.state.route_config` idiom).
+            let route_carrier: Option<std::sync::Arc<RouteConfig>> = request
+                .extensions()
+                .get::<std::sync::Arc<RouteConfig>>()
+                .cloned()
+                .or_else(|| {
+                    transform
+                        .route_configs()
+                        .and_then(|resolver| resolver(&facts.method, &facts.path))
+                });
+            let route = route_carrier.as_deref();
+            // The reference `RouteConfigResolver.should_bypass_check`: the
+            // named check, or the `"all"` wildcard.
+            let bypassed = |check: &str| {
+                route.is_some_and(|route| {
+                    route.bypassed_checks.contains("all") || route.bypassed_checks.contains(check)
+                })
+            };
+
             // The IP gate runs before anything else: a denied IP must not
-            // cost a body buffer, and detection still scans whatever passes.
-            if let Some(response) = enforce_ip_gate(&request, &transform) {
+            // cost a body buffer, and detection still scans whatever
+            // passes. The reference `ip_security` bypass skips the gate
+            // (and the ban/geo arms below, the fused `ip_security` block).
+            if !bypassed("ip_security")
+                && let Some(response) = enforce_ip_gate(&request, &transform)
+            {
                 return Ok(finish_generated(&request, &transform, response));
             }
 
             // Check 2: emergency mode (503 outside the whitelist).
-            if let Some(stage) = transform.emergency_mode()
+            if !bypassed("emergency_mode")
+                && let Some(stage) = transform.emergency_mode()
                 && let Some(answer) = stage.decide(
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
                     &facts.ip_string,
@@ -169,20 +197,36 @@ where
             }
 
             // Check 3: HTTPS enforcement (301 to the scheme-upgraded URL).
-            if let Some(stage) = transform.https_enforcement() {
+            // The route's `require_https` rides the same stage (the
+            // carrier lane), so the trust knobs and the passive handling
+            // match the global arm.
+            if !bypassed("https_enforcement") {
                 let https_url = format!(
                     "https://{}{}{}",
                     facts.host.as_deref().unwrap_or_default(),
                     facts.path,
                     facts.query
                 );
-                if let Some(redirect) = stage.decide(
-                    &facts.path,
-                    &facts.scheme,
-                    facts.host.as_deref().map(host_of_authority),
-                    facts.x_forwarded_proto.as_deref(),
-                    &https_url,
-                ) {
+                let route_require_https = route.is_some_and(|route| route.require_https);
+                let answer = if let Some(stage) = transform.https_enforcement() {
+                    stage.decide_route(
+                        &facts.path,
+                        &facts.scheme,
+                        facts.host.as_deref().map(host_of_authority),
+                        facts.x_forwarded_proto.as_deref(),
+                        &https_url,
+                        route_require_https.then_some(true),
+                    )
+                } else if route_require_https && facts.scheme != "https" && !transform.passive_mode
+                {
+                    Some(guard_core_rs::https_enforcement::HttpsRedirectAnswer {
+                        status: 301,
+                        location: https_url,
+                    })
+                } else {
+                    None
+                };
+                if let Some(redirect) = answer {
                     return Ok(finish_generated(
                         &request,
                         &transform,
@@ -193,7 +237,9 @@ where
 
             // Check 4: request logging (compose-only, never blocks; the
             // composed line is the host's to emit).
-            if let Some(stage) = transform.request_logging() {
+            if !bypassed("request_logging")
+                && let Some(stage) = transform.request_logging()
+            {
                 let _ = stage.compose(
                     facts.ip.is_some().then_some(facts.ip_string.as_str()),
                     Some(&facts.method),
@@ -203,8 +249,15 @@ where
             }
 
             // Check 5: the request body buffers under the size cap (413) -
-            // the reference `request_size_content` stage.
-            let buffered = match buffer_body(payload, transform.body_cap()).await {
+            // the reference `request_size_content` stage. The route's
+            // `max_request_size` replaces the global cap for the route
+            // (the reference reads the route limit instead); the adapter's
+            // own cap stays the ceiling when the route sets none.
+            let body_cap = route
+                .and_then(|route| route.max_request_size)
+                .and_then(|size| usize::try_from(size).ok())
+                .unwrap_or_else(|| transform.body_cap());
+            let buffered = match buffer_body(payload, body_cap).await {
                 Ok(buffered) => buffered,
                 Err(BufferFailure::TooLarge) => {
                     return Ok(finish_generated(
@@ -222,8 +275,12 @@ where
                 }
             };
 
-            // Checks 6 + 7: required headers, then authentication.
-            if let Some(stage) = transform.headers_auth() {
+            // Checks 6 + 7: required headers, then authentication (the
+            // fused stage answers for both; bypassing either reference
+            // check skips the whole stage).
+            if !(bypassed("required_headers") || bypassed("authentication"))
+                && let Some(stage) = transform.headers_auth()
+            {
                 let pairs: Vec<(&str, &str)> = request
                     .headers()
                     .iter()
@@ -242,7 +299,8 @@ where
             }
 
             // Check 8: the route referrer gate.
-            if let Some(stage) = transform.referrer_gate()
+            if !bypassed("referrer")
+                && let Some(stage) = transform.referrer_gate()
                 && let Some(answer) = stage.decide(
                     &facts.path,
                     facts.referer.as_deref(),
@@ -261,7 +319,8 @@ where
 
             // Check 9: the route custom validators (first blocking
             // response wins, the validator's own shape).
-            if let Some(stage) = transform.custom_checks()
+            if !bypassed("custom_validators")
+                && let Some(stage) = transform.custom_checks()
                 && let Some(failure) = stage.decide_custom_validators(
                     &facts.path,
                     &facts.method,
@@ -273,7 +332,8 @@ where
             }
 
             // Check 10: the route time-window gate.
-            if let Some(stage) = transform.time_window_gate()
+            if !bypassed("time_window")
+                && let Some(stage) = transform.time_window_gate()
                 && let Some(answer) =
                     stage.decide(&facts.path, &facts.ip_string, &facts.path, &facts.method)
             {
@@ -286,17 +346,23 @@ where
             }
 
             // The detection scan itself never blocks: the verdict feeds
-            // the pipeline stages that do.
-            let verdict = match scan_request(&request, buffered.as_ref(), &transform) {
-                ScanOutcome::Clean => None,
-                ScanOutcome::Failed => {
-                    return Ok(finish_generated(
-                        &request,
-                        &transform,
-                        response::failure(request.clone()),
-                    ));
+            // the pipeline stages that do. The reference
+            // `suspicious_activity` bypass skips the scan (and with it the
+            // violation feed) for the route.
+            let verdict = if bypassed("suspicious_activity") {
+                None
+            } else {
+                match scan_request(&request, buffered.as_ref(), &transform) {
+                    ScanOutcome::Clean => None,
+                    ScanOutcome::Failed => {
+                        return Ok(finish_generated(
+                            &request,
+                            &transform,
+                            response::failure(request.clone()),
+                        ));
+                    }
+                    ScanOutcome::Threat(verdict) => Some(verdict),
                 }
-                ScanOutcome::Threat(verdict) => Some(verdict),
             };
 
             // One engine-stage pass, split at the reference pipeline's
@@ -315,7 +381,9 @@ where
                     trigger_info: verdict.reason.clone(),
                 });
             let observation = request_observation(&request);
-            if let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation)) {
+            if !bypassed("ip_security")
+                && let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation))
+            {
                 return Ok(finish_generated(
                     &request,
                     &transform,
@@ -323,7 +391,10 @@ where
                 ));
             }
 
-            if let Some(stage) = transform.geo_blocking()
+            // The reference runs the country arms inside `ip_security`:
+            // the same bypass skips the geo stage.
+            if !bypassed("ip_security")
+                && let Some(stage) = transform.geo_blocking()
                 && let Some(decision) = stage.decide(facts.ip, facts.gate)
             {
                 return Ok(block_response(
@@ -334,7 +405,8 @@ where
                 ));
             }
 
-            if let Some(stage) = transform.cloud_provider()
+            if !bypassed("cloud_provider")
+                && let Some(stage) = transform.cloud_provider()
                 && let Some(decision) = stage.decide(facts.ip, facts.gate)
             {
                 return Ok(block_response(
@@ -345,33 +417,90 @@ where
                 ));
             }
 
-            if let Some(stage) = transform.user_agent()
-                && let Some(answer) = stage.decide(
+            if !bypassed("user_agent") {
+                // The route's `blocked_user_agents` runs additively before
+                // the global filter (the reference
+                // `check_user_agent_allowed` order); whitelisted and
+                // exempt IPs skip exactly what the stage skips. A
+                // non-compilable route pattern fails secure.
+                let route_blocks = route
+                    .filter(|route| !route.blocked_user_agents.is_empty())
+                    .filter(|_| {
+                        !facts
+                            .gate
+                            .is_some_and(|gate| gate.is_whitelisted || gate.is_exempt)
+                    })
+                    .map(|route| {
+                        guard_core_engine::user_agent::UserAgentFilter::from_trusted_patterns(
+                            route.blocked_user_agents.iter().cloned(),
+                        )
+                    });
+                match route_blocks {
+                    Some(Ok(filter))
+                        if filter.is_blocked(facts.user_agent.as_deref().unwrap_or("")) =>
+                    {
+                        return Ok(block_response(
+                            &request,
+                            &transform,
+                            403,
+                            "User-Agent not allowed",
+                        ));
+                    }
+                    Some(Err(_)) => {
+                        return Ok(finish_generated(
+                            &request,
+                            &transform,
+                            response::failure(request.clone()),
+                        ));
+                    }
+                    _ => {}
+                }
+                if let Some(stage) = transform.user_agent()
+                    && let Some(answer) = stage.decide(
+                        facts.ip,
+                        facts.gate,
+                        Some(&facts.path),
+                        facts.user_agent.as_deref(),
+                        finding.as_ref(),
+                    )
+                {
+                    return Ok(block_response(
+                        &request,
+                        &transform,
+                        answer.status.as_u16(),
+                        stage_answer_body(&answer),
+                    ));
+                }
+            }
+
+            // The carrier's rate-limit view is the route's tier (the
+            // reference reads `route_config.rate_limit`/
+            // `rate_limit_window`/`geo_rate_limits`); an invalid tier
+            // fails secure, and the `rate_limit` bypass skips the pass.
+            let carrier_tiers = match route.map(RouteConfig::rate_limits) {
+                Some(Ok(tiers)) => tiers,
+                Some(Err(_)) => {
+                    return Ok(finish_generated(
+                        &request,
+                        &transform,
+                        response::failure(request.clone()),
+                    ));
+                }
+                None => None,
+            };
+            let extension_tiers = request.extensions().get::<RouteRateLimits>().cloned();
+            let effective_tiers = carrier_tiers.as_ref().or(extension_tiers.as_ref());
+            let gate = request.extensions().get::<IpGateDecision>().copied();
+            if !bypassed("rate_limit")
+                && let Some(blocked) = stage.decide_tiers_observed(
                     facts.ip,
-                    facts.gate,
                     Some(&facts.path),
-                    facts.user_agent.as_deref(),
+                    effective_tiers,
+                    gate,
                     finding.as_ref(),
+                    Some(&observation),
                 )
             {
-                return Ok(block_response(
-                    &request,
-                    &transform,
-                    answer.status.as_u16(),
-                    stage_answer_body(&answer),
-                ));
-            }
-
-            let route = request.extensions().get::<RouteRateLimits>().cloned();
-            let gate = request.extensions().get::<IpGateDecision>().copied();
-            if let Some(blocked) = stage.decide_tiers_observed(
-                facts.ip,
-                Some(&facts.path),
-                route.as_ref(),
-                gate,
-                finding.as_ref(),
-                Some(&observation),
-            ) {
                 return Ok(finish_generated(
                     &request,
                     &transform,
@@ -411,7 +540,8 @@ where
             // Check 17: the global `custom_request` function (its own
             // response shape; a response without a status renders the
             // framework default 200).
-            if let Some(stage) = transform.custom_checks()
+            if !bypassed("custom_request")
+                && let Some(stage) = transform.custom_checks()
                 && let Some(answer) = stage.decide_custom_request(
                     &facts.method,
                     &facts.path,
@@ -3003,5 +3133,331 @@ mod tests {
             crate::map_log_level(guard_core_engine::security_config::LogLevel::Critical),
             guard_core_rs::logging::LogLevel::Critical
         ));
+    }
+
+    // --- the reference RouteConfig carrier consumption (GAP-R2) ---
+
+    use crate::RouteConfig;
+    use guard_core_engine::route_config::RouteConfigResolver;
+
+    fn resolver_for(paths: &[(&str, &str)], config: RouteConfig) -> RouteConfigResolver {
+        let owned: Vec<(String, String)> = paths
+            .iter()
+            .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
+            .collect();
+        Arc::new(move |method, path| {
+            owned
+                .iter()
+                .any(|(route_method, route_path)| route_method == method && route_path == path)
+                .then(|| Arc::new(config.clone()))
+        })
+    }
+
+    fn carrier_request(method: &str, uri: &str, ip: &str) -> ServiceRequest {
+        TestRequest::default()
+            .method(actix_web::http::Method::from_bytes(method.as_bytes()).expect("method"))
+            .uri(uri)
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str(ip).expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request()
+    }
+
+    #[actix_web::test]
+    async fn the_route_bypass_skips_the_scan_for_its_path_only() {
+        let config = RouteConfig {
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("suspicious_activity"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/open")], config));
+        let (open, _) = status_body(
+            transform.clone(),
+            carrier_request("GET", "/open?q=1%27+OR+1%3D1", "192.0.2.9"),
+        )
+        .await;
+        assert_eq!(open, StatusCode::OK);
+        let (blocked, _) = status_body(
+            transform,
+            carrier_request("GET", "/locked?q=1%27+OR+1%3D1", "192.0.2.9"),
+        )
+        .await;
+        assert_eq!(blocked, StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn route_require_https_forces_the_redirect() {
+        let config = RouteConfig {
+            require_https: true,
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/tls")], config));
+        let request = TestRequest::get()
+            .uri("/tls")
+            .insert_header(("host", "guard.example"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("192.0.2.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (status, _, _) = full_status(transform, request).await;
+        assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    }
+
+    #[actix_web::test]
+    async fn the_route_rate_view_becomes_the_tier() {
+        let config = RouteConfig {
+            rate_limit: Some(1),
+            rate_limit_window: Some(60),
+            ..RouteConfig::default()
+        };
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1000,
+            rate_limit_window: 60,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter)
+            .with_route_configs(resolver_for(&[("GET", "/login")], config));
+        let (first, _, _) = full_status(
+            transform.clone(),
+            carrier_request("GET", "/login", "192.0.2.9"),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, _, retry_after) =
+            full_status(transform, carrier_request("GET", "/login", "192.0.2.9")).await;
+        assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after.as_deref(), Some("60"));
+    }
+
+    #[actix_web::test]
+    async fn the_carrier_extension_wins_over_the_resolver() {
+        let config = RouteConfig {
+            rate_limit: Some(1),
+            rate_limit_window: Some(60),
+            ..RouteConfig::default()
+        };
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1000,
+            rate_limit_window: 60,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let transform = GuardTransform::new(default_config())
+            .with_rate_limiting(limiter)
+            .with_route_configs(resolver_for(&[("GET", "/login")], config));
+        let request = with_ext(
+            carrier_request("GET", "/login", "192.0.2.9"),
+            Arc::new(RouteConfig::default()),
+        );
+        let (first, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, _, _) =
+            full_status(transform, carrier_request("GET", "/login", "192.0.2.9")).await;
+        assert_eq!(second, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn route_blocked_user_agents_answer_the_403() {
+        let config = RouteConfig {
+            blocked_user_agents: vec![String::from("route-bot")],
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let request = TestRequest::get()
+            .uri("/api")
+            .insert_header(("user-agent", "route-bot/2.0"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("192.0.2.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (blocked, body, _) = full_status(transform, request).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+        assert_eq!(body, "User-Agent not allowed");
+    }
+
+    #[actix_web::test]
+    async fn an_invalid_carrier_tier_fails_secure() {
+        let config = RouteConfig {
+            rate_limit: Some(0),
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/bad")], config));
+        let (status, _, _) =
+            full_status(transform, carrier_request("GET", "/bad", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[actix_web::test]
+    async fn the_ip_security_bypass_skips_the_gate_for_its_route() {
+        let gate = crate::IpGateConfig::new([] as [&str; 0], ["192.0.2.9"], [] as [&str; 0])
+            .expect("valid lists");
+        let config = RouteConfig {
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("ip_security"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_ip_gate(gate)
+            .with_route_configs(resolver_for(&[("GET", "/open")], config));
+        let (open, _) = status_body(
+            transform.clone(),
+            carrier_request("GET", "/open", "192.0.2.9"),
+        )
+        .await;
+        assert_eq!(open, StatusCode::OK);
+        let (blocked, _) =
+            status_body(transform, carrier_request("GET", "/locked", "192.0.2.9")).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+    }
+
+    #[actix_web::test]
+    async fn the_route_bypass_skips_emergency_mode_for_its_path() {
+        let stage = guard_core_rs::emergency_mode::EmergencyModeStage::builder(
+            guard_core_rs::emergency_mode::EmergencyModeStageConfig::default(),
+        )
+        .emergency_mode(true)
+        .build()
+        .expect("valid stage");
+        let config = RouteConfig {
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("emergency_mode"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_emergency_mode(stage)
+            .with_route_configs(resolver_for(&[("GET", "/open")], config));
+        let (blocked, _) = status_body(
+            transform.clone(),
+            carrier_request("GET", "/locked", "192.0.2.9"),
+        )
+        .await;
+        assert_eq!(blocked, StatusCode::SERVICE_UNAVAILABLE);
+        let (open, _) = status_body(transform, carrier_request("GET", "/open", "192.0.2.9")).await;
+        assert_eq!(open, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn the_user_agent_bypass_skips_both_lists_for_the_route() {
+        let config = RouteConfig {
+            blocked_user_agents: vec![String::from("route-bot")],
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("user_agent"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let stage = guard_core_rs::user_agent::UserAgentStage::builder(
+            guard_core_rs::user_agent::UserAgentStageConfig {
+                blocked_user_agents: guard_core_engine::user_agent::UserAgentFilter::new([
+                    "global-bot",
+                ])
+                .expect("valid patterns"),
+                ip_ban: guard_core_engine::ip_ban::IpBanConfig {
+                    enable_ip_banning: false,
+                    ..guard_core_engine::ip_ban::IpBanConfig::default()
+                },
+                passive_mode: false,
+            },
+        )
+        .build()
+        .expect("valid stage");
+        let transform = GuardTransform::new(default_config())
+            .with_user_agent(stage)
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        // Both the route list and the global list are skipped on the
+        // bypassed route.
+        let request = TestRequest::get()
+            .uri("/api")
+            .insert_header(("user-agent", "route-bot"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("192.0.2.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (open, _) = status_body(transform, request).await;
+        assert_eq!(open, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn a_non_compilable_route_pattern_fails_secure() {
+        let config = RouteConfig {
+            blocked_user_agents: vec![String::from("([")],
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, body, _) =
+            full_status(transform, carrier_request("GET", "/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, crate::FAILURE_MESSAGE);
+    }
+
+    #[actix_web::test]
+    async fn the_https_enforcement_bypass_skips_both_arms_for_the_route() {
+        let stage = guard_core_rs::https_enforcement::HttpsEnforcementStage::builder(
+            guard_core_rs::https_enforcement::HttpsEnforcementStageConfig {
+                enforce_https: true,
+                trust_x_forwarded_proto: false,
+                passive_mode: false,
+            },
+        )
+        .build()
+        .expect("valid stage");
+        let config = RouteConfig {
+            require_https: true,
+            bypassed_checks: {
+                let mut set = std::collections::BTreeSet::new();
+                set.insert(String::from("https_enforcement"));
+                set
+            },
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_https_enforcement(stage)
+            .with_route_configs(resolver_for(&[("GET", "/plain")], config));
+        // Both the global arm and the route's require_https are skipped on
+        // the bypassed route.
+        let request = TestRequest::get()
+            .uri("/plain")
+            .insert_header(("host", "guard.example"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("192.0.2.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (plain, _, _) = full_status(transform.clone(), request).await;
+        assert_eq!(plain, StatusCode::OK);
+        // The global arm still answers next door.
+        let request = TestRequest::get()
+            .uri("/other")
+            .insert_header(("host", "guard.example"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("192.0.2.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (redirect, _, _) = full_status(transform, request).await;
+        assert_eq!(redirect, StatusCode::MOVED_PERMANENTLY);
     }
 }
