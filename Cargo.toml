@@ -33,9 +33,9 @@ guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", versio
 # published facade release.
 guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.3.1" }
 serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 actix-web = { version = "4", features = ["macros"] }
 
 [lints.rust]
