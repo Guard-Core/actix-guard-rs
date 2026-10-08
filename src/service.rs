@@ -147,6 +147,32 @@ where
                 return Ok(forwarded);
             }
 
+            // The reference's CORS preflight short-circuit: an OPTIONS
+            // request carrying `access-control-request-method` answers from
+            // the resolved CORS config directly (the reference
+            // `is_preflight` + `build_preflight_response` in
+            // `cors_handler.py`), before every security check. CORS
+            // disabled (or no response processor) leaves OPTIONS requests
+            // to the pipeline like any other method.
+            if facts.method.eq_ignore_ascii_case("OPTIONS")
+                && let Some(processor) = transform.response_processor.as_ref()
+                && processor.cors_enabled()
+                && let Some(answer) =
+                    preflight_answer(processor.cors().expect("cors enabled"), &request)
+            {
+                let mut response =
+                    response::blocked_with_body(request.clone(), answer.status_code, &answer.body);
+                for (name, value) in &answer.headers {
+                    if let (Ok(name), Ok(value)) = (
+                        actix_web::http::header::HeaderName::try_from(name.as_str()),
+                        actix_web::http::header::HeaderValue::from_str(value),
+                    ) {
+                        response.headers_mut().insert(name, value);
+                    }
+                }
+                return Ok(response.map_into_boxed_body());
+            }
+
             // The reference `RouteConfigResolver`: the carrier extension
             // wins over the installed resolver (the app attaches the
             // route's config directly, the reference
@@ -161,6 +187,42 @@ where
                         .and_then(|resolver| resolver(&facts.method, &facts.path))
                 });
             let route = route_carrier.as_deref();
+
+            // The reference `process_usage_rules`: the route's usage and
+            // frequency behavior rules track the request observation and a
+            // crossed threshold dispatches the rule's action (a `ban`
+            // lands in the shared ban manager and renders the banned
+            // shape). The behavioral processor runs before the check
+            // pipeline (the reference dispatches it from the middleware's
+            // request pass).
+            let route_rules: &[guard_core_engine::behavior::BehaviorRule] =
+                route.map_or(&[], |route| &route.behavior_rules);
+            if !route_rules.is_empty()
+                && let Some(processor) = transform.response_processor.as_ref()
+            {
+                let endpoint_id = format!("{}:{}", facts.method, facts.path);
+                let actions = processor.process_usage_rules(
+                    &endpoint_id,
+                    &facts.ip_string,
+                    route_rules,
+                    std::time::SystemTime::now(),
+                );
+                if actions
+                    .iter()
+                    .any(guard_core_engine::behavior::BehaviorAction::is_ban)
+                {
+                    return Ok(finish_generated(
+                        &request,
+                        &transform,
+                        response::blocked_with_body(
+                            request.clone(),
+                            403,
+                            crate::ACTIVITY_BANNED_MESSAGE,
+                        ),
+                    ));
+                }
+            }
+
             // The reference `RouteConfigResolver.should_bypass_check`: the
             // named check, or the `"all"` wildcard.
             let bypassed = |check: &str| {
@@ -708,6 +770,53 @@ fn block_response(
 
 /// A guard-generated answer (block, redirect, oversize, failure) with the
 /// response-side pass applied.
+/// The CORS preflight short-circuit answer (the reference `is_preflight`
+/// plus `build_preflight_response`).
+///
+/// `Some` when the request is a preflight (OPTIONS carrying the
+/// request-method header), rendered from the resolved CORS config alone:
+/// the reference answers the preflight before the pipeline and its
+/// response pass run.
+fn preflight_answer(
+    cors: &guard_core_engine::cors::CorsConfig,
+    request: &HttpRequest,
+) -> Option<guard_core_engine::cors::CorsPreflightResponse> {
+    let request_headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    if !guard_core_engine::cors::is_preflight(request.method().as_str(), &request_headers) {
+        return None;
+    }
+    Some(guard_core_engine::cors::build_preflight_response(
+        cors,
+        guard_core_engine::cors::PreflightRequest {
+            origin: request_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("origin"))
+                .map(|(_, value)| value.as_str()),
+            request_method: request_headers
+                .iter()
+                .find(|(name, _)| {
+                    name.eq_ignore_ascii_case(
+                        guard_core_engine::cors::ALLOWED_PREFLIGHT_REQUEST_HEADER,
+                    )
+                })
+                .map(|(_, value)| value.as_str()),
+            request_headers_raw: request_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("access-control-request-headers"))
+                .map(|(_, value)| value.as_str()),
+        },
+    ))
+}
+
 fn finish_generated(
     request: &HttpRequest,
     transform: &GuardTransform,
@@ -729,7 +838,7 @@ fn run_response_processor_parts(
     status: u16,
     response: &mut ServiceResponse,
 ) {
-    if transform.response_processor().is_none() {
+    if transform.response_processor.as_ref().is_none() {
         return;
     }
     let headers = compute_processor_headers(
@@ -758,7 +867,7 @@ fn run_response_processor(
     status: u16,
     response: &mut actix_web::HttpResponse,
 ) {
-    if transform.response_processor().is_none() {
+    if transform.response_processor.as_ref().is_none() {
         return;
     }
     let headers = compute_processor_headers(
@@ -786,7 +895,7 @@ fn compute_processor_headers(
     origin: Option<&str>,
     status: u16,
 ) -> Option<actix_web::http::header::HeaderMap> {
-    let processor = transform.response_processor()?;
+    let processor = transform.response_processor.as_ref()?;
     let mut bits = ResponseBits {
         status,
         body: None,
@@ -1051,6 +1160,166 @@ mod tests {
     fn body_text(response: ServiceResponse) -> String {
         let bytes = response.into_body().try_into_bytes().expect("bytes");
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[actix_web::test]
+    async fn the_cors_preflight_short_circuits_before_every_check() {
+        let transform = GuardTransform::from_security_config(&SecurityConfig {
+            enable_cors: true,
+            cors_allow_origins: vec!["https://app.example.com".to_owned()],
+            cors_allow_methods: vec!["GET".to_owned(), "POST".to_owned()],
+            cors_allow_headers: vec!["content-type".to_owned()],
+            cors_max_age: 900,
+            ..SecurityConfig::default()
+        })
+        .expect("valid config");
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .wrap(transform)
+                .service(actix_web::web::resource("/api")),
+        )
+        .await;
+
+        // The allowed preflight answers from the CORS config alone.
+        let request = actix_web::test::TestRequest::default()
+            .method(actix_web::http::Method::OPTIONS)
+            .uri("/api")
+            .insert_header(("Origin", "https://app.example.com"))
+            .insert_header(("Access-Control-Request-Method", "POST"))
+            .insert_header(("Access-Control-Request-Headers", "Content-Type"))
+            .to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://app.example.com")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Access-Control-Max-Age")
+                .and_then(|value| value.to_str().ok()),
+            Some("900")
+        );
+
+        // The disallowed origin: 400 with the failure list.
+        let request = actix_web::test::TestRequest::default()
+            .method(actix_web::http::Method::OPTIONS)
+            .uri("/api")
+            .insert_header(("Origin", "https://evil.example.com"))
+            .insert_header(("Access-Control-Request-Method", "DELETE"))
+            .to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let body = actix_web::test::read_body(response).await;
+        assert_eq!(body, "Disallowed CORS: origin, method");
+
+        // An OPTIONS without the request-method header is not a preflight:
+        // the guard skips it and the router answers (405: the resource
+        // registers GET only - the request reached the router, which is
+        // the pass-through proof).
+        let request = actix_web::test::TestRequest::default()
+            .method(actix_web::http::Method::OPTIONS)
+            .uri("/api")
+            .to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+
+    #[test]
+    fn preflight_answer_answers_only_preflight_requests() {
+        let cors = guard_core_engine::cors::CorsConfig {
+            enabled: true,
+            ..guard_core_engine::cors::CorsConfig::default()
+        };
+        // A preflight: Some, the engine's answer.
+        let preflight = actix_web::test::TestRequest::default()
+            .method(actix_web::http::Method::OPTIONS)
+            .insert_header(("Origin", "https://app.example.com"))
+            .insert_header(("Access-Control-Request-Method", "POST"))
+            .to_http_request();
+        let answer = preflight_answer(&cors, &preflight);
+        assert!(answer.is_some());
+        assert_eq!(answer.expect("answer").status_code, 200);
+
+        // A plain OPTIONS: None, the pipeline's domain.
+        let plain = actix_web::test::TestRequest::default()
+            .method(actix_web::http::Method::OPTIONS)
+            .to_http_request();
+        assert!(preflight_answer(&cors, &plain).is_none());
+
+        // A GET carrying the header: still not a preflight.
+        let get = actix_web::test::TestRequest::default()
+            .method(actix_web::http::Method::GET)
+            .insert_header(("Access-Control-Request-Method", "POST"))
+            .to_http_request();
+        assert!(preflight_answer(&cors, &get).is_none());
+    }
+
+    #[actix_web::test]
+    async fn the_route_usage_rules_track_and_ban_at_the_threshold() {
+        let config = RouteConfig {
+            behavior_rules: vec![guard_core_engine::behavior::BehaviorRule {
+                rule_type: String::from("usage"),
+                threshold: 2,
+                window: 60,
+                pattern: String::new(),
+                action: String::from("ban"),
+                ban_duration: Some(3600),
+                correlate_with_detection: false,
+            }],
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_response_processor(guard_core_rs::process_response::ResponseProcessor::new(
+                None,
+                None,
+                Vec::new(),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    guard_core_engine::behavior::BehaviorTracker::new(),
+                )),
+                IpBanManager::new(),
+                true,
+                262_144,
+                false,
+            ))
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let app = actix_web::test::init_service(
+            actix_web::App::new().wrap(transform).service(
+                actix_web::web::resource("/api").route(
+                    actix_web::web::get()
+                        .to(|| async { actix_web::HttpResponse::Ok().body("upstream") }),
+                ),
+            ),
+        )
+        .await;
+
+        for _ in 0..2 {
+            let request = actix_web::test::TestRequest::default()
+                .method(actix_web::http::Method::GET)
+                .uri("/api")
+                .peer_addr("192.0.2.71:45000".parse().expect("addr"))
+                .to_request();
+            let response = actix_web::test::call_service(&app, request).await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        }
+        // The third crossing bans (the rule's action dispatched into the
+        // shared ban manager).
+        let request = actix_web::test::TestRequest::default()
+            .method(actix_web::http::Method::GET)
+            .uri("/api")
+            .peer_addr("192.0.2.71:45000".parse().expect("addr"))
+            .to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::FORBIDDEN);
+        let body = actix_web::test::read_body(response).await;
+        assert_eq!(body, crate::ACTIVITY_BANNED_MESSAGE);
     }
 
     #[actix_web::test]
@@ -3083,7 +3352,7 @@ mod tests {
             ..SecurityConfig::default()
         };
         let transform = GuardTransform::from_security_config(&config).expect("valid config");
-        assert!(transform.response_processor().is_none());
+        assert!(transform.response_processor.as_ref().is_none());
     }
 
     #[test]
