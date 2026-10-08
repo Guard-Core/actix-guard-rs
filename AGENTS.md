@@ -3,9 +3,9 @@ Guidance for AI agents (including Claude Code) working in this repository.
 
 ## Project Overview
 
-actix-guard-rs is the actix-web adapter for the Guard ecosystem: an [`actix_web::dev::Transform`](https://docs.rs/actix-web/latest/actix_web/dev/trait.Transform.html) plus [`actix_web::dev::Service`](https://docs.rs/actix-web/latest/actix_web/dev/trait.Service.html) that screens `ServiceRequest` traffic through the [guard-core-rs](https://github.com/rennf93/guard-core-rs) detection engine before forwarding it to the wrapped service. It contains no security logic of its own.
+actix-guard-rs is the actix-web adapter for the Guard ecosystem: an [`actix_web::dev::Transform`](https://docs.rs/actix-web/latest/actix_web/dev/trait.Transform.html) plus [`actix_web::dev::Service`](https://docs.rs/actix-web/latest/actix_web/dev/trait.Service.html) that screens `ServiceRequest` traffic through the [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine before forwarding it to the wrapped service. It contains no security logic of its own.
 
-- **Repository**: https://github.com/rennf93/actix-guard-rs
+- **Repository**: https://github.com/Guard-Core/actix-guard-rs
 - **Language**: Rust, edition 2024, MSRV 1.92
 - **License**: MIT OR Apache-2.0
 - **Version**: 1.2.0 (published to crates.io)
@@ -69,7 +69,7 @@ The next service is shared through an `Rc<S>` (`GuardService`), not cloned: the 
 - Registry note, stated plainly: the 4.1.0 dists were yanked (the version-accuracy fix for the family tag mistake); the 1.2.0 release trains with the 4.2.0 engine and restores registry resolution.
 - **TODO(engine):** switch to the versioned crates.io dependency once `guard-core-rs` is tagged and published.
 - The engine crate is used directly for `detect`; the facade dependency supplies the pipeline-side modules (events, geo, cloud provider, responses, and the rate-limit/ban stage wiring). The facade re-exports the full engine stage set since 4.1.0.
-- CI checks out `rennf93/guard-core-rs` (branch `master`, moving branch by design, documented in `.github/workflows/ci.yml`) into `../guard-core-rs` before building, mirroring `tower-guard-rs`. Do not replace that with a git dependency without updating the CI comment and this file.
+- CI checks out `Guard-Core/guard-core-rs` (branch `master`, moving branch by design, documented in `.github/workflows/ci.yml`) into `../guard-core-rs` before building, mirroring `tower-guard-rs`. Do not replace that with a git dependency without updating the CI comment and this file.
 
 ## Development Commands
 
@@ -154,7 +154,7 @@ actix-guard-rs/
 
 ## Related Projects
 
-- [guard-core-rs](https://github.com/rennf93/guard-core-rs): Rust detection engine (this crate's dependency).
-- [tower-guard-rs](https://github.com/rennf93/tower-guard-rs): tower adapter whose semantics this crate mirrors.
-- [guard-core](https://github.com/rennf93/guard-core): Python reference implementation and spec owner.
-- [fastapi-guard](https://github.com/rennf93/fastapi-guard): the most mature adapter in the ecosystem, a useful reference for feature coverage.
+- [guard-core-rs](https://github.com/Guard-Core/guard-core-rs): Rust detection engine (this crate's dependency).
+- [tower-guard-rs](https://github.com/Guard-Core/tower-guard-rs): tower adapter whose semantics this crate mirrors.
+- [guard-core](https://github.com/Guard-Core/guard-core): Python reference implementation and spec owner.
+- [fastapi-guard](https://github.com/Guard-Core/fastapi-guard): the most mature adapter in the ecosystem, a useful reference for feature coverage.

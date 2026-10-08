@@ -1,6 +1,6 @@
 ---
 name: actix-guard-rs
-description: Use when working in actix-guard-rs (github.com/rennf93/actix-guard-rs), the actix-web 4 adapter for the guard-core-rs detection engine: editing the Transform/Service middleware, adding or changing engine view mapping (url_path/query_param/header/request_body), changing the request body buffering cap or the 403/413/500 fail-secure response translation, changing the request-rebuild or Rc service-sharing design, wiring the guard-core-rs engine dependency (path vs versioned, CI checkout), or answering questions about what the adapter inspects and blocks. Covers CI-verified cargo commands, the EXCLUDED_HEADERS policy, and the cfg(test) detector seam for panic-recovery tests.
+description: Use when working in actix-guard-rs (github.com/Guard-Core/actix-guard-rs), the actix-web 4 adapter for the guard-core-rs detection engine: editing the Transform/Service middleware, adding or changing engine view mapping (url_path/query_param/header/request_body), changing the request body buffering cap or the 403/413/500 fail-secure response translation, changing the request-rebuild or Rc service-sharing design, wiring the guard-core-rs engine dependency (path vs versioned, CI checkout), or answering questions about what the adapter inspects and blocks. Covers CI-verified cargo commands, the EXCLUDED_HEADERS policy, and the cfg(test) detector seam for panic-recovery tests.
 ---
 
 # actix-guard-rs
@@ -53,7 +53,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 - `panic = "abort"` disables the `catch_unwind` recovery; the process dies before the `500` can be returned. Documented, not mitigated.
 - The panic test relies on `#[cfg(test)] GuardTransform::with_detect_fn`. It does not exist in production builds; do not make it public.
 - `App::wrap` applies the transform over `T::Service`; do not add an `S: Clone` bound back, it breaks `App::wrap` (actix app services are not `Clone`).
-- The engine dependency is a path dependency (`../guard-core-rs/crates/guard-core-engine`) with a `TODO(engine)` to move to the versioned crate. CI checks out `rennf93/guard-core-rs@master` into place. The facade crate `guard-core-rs` is NOT used because it does not re-export `detect`.
+- The engine dependency is a path dependency (`../guard-core-rs/crates/guard-core-engine`) with a `TODO(engine)` to move to the versioned crate. CI checks out `Guard-Core/guard-core-rs@master` into place. The facade crate `guard-core-rs` is NOT used because it does not re-export `detect`.
 - Payloads in tests must come from the spec 4.0.2 corpus (`guard-core-rs/conformance/guard-core-spec-4.0.2/cases/`) so they are guaranteed threats. Raw spaces are invalid in test URIs: percent-encode (`$(echo id)` becomes `$(echo%20id)`); the engine's preprocessor decodes it back.
 
 ## Related
