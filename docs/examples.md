@@ -1,7 +1,7 @@
 # Examples
 
 The repository ships two runnable applications under
-[`examples/`](https://github.com/rennf93/actix-guard-rs/tree/master/examples).
+[`examples/`](https://github.com/Guard-Core/actix-guard-rs/tree/master/examples).
 Both use the real adapter surface (`GuardTransform` registered with
 `App::wrap` or `web::scope::wrap`).
 
@@ -12,7 +12,7 @@ path dependency, so building them locally requires a sibling
 ## simple_app
 
 A minimal guarded actix-web application
-([`examples/simple_app`](https://github.com/rennf93/actix-guard-rs/tree/master/examples/simple_app)):
+([`examples/simple_app`](https://github.com/Guard-Core/actix-guard-rs/tree/master/examples/simple_app)):
 
 | Route | Guard | Behavior |
 |---|---|---|
@@ -34,7 +34,7 @@ cargo run -p actix-guard-simple-app
 ## advanced_app
 
 A production-shaped guarded application
-([`examples/advanced_app`](https://github.com/rennf93/actix-guard-rs/tree/master/examples/advanced_app))
+([`examples/advanced_app`](https://github.com/Guard-Core/actix-guard-rs/tree/master/examples/advanced_app))
 that demonstrates the two knobs a real deployment tunes: environment-driven
 engine configuration and route-scoped guard configuration. The `/admin` scope
 is screened by a second, stricter `GuardTransform` (threat-score threshold

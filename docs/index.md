@@ -2,8 +2,8 @@
 
 `actix-guard-rs` is application-layer security middleware for
 [actix-web](https://github.com/actix/actix-web) 4, powered by the
-[guard-core-rs](https://github.com/rennf93/guard-core-rs) detection engine.
-It is part of the [Guard ecosystem](https://github.com/rennf93).
+[guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection engine.
+It is part of the [Guard ecosystem](https://github.com/Guard-Core).
 
 The crate holds framework glue only: every detection decision comes from the
 engine. `GuardTransform` is a working actix-web `Transform` factory and

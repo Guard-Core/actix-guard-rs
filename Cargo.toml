@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.92"
 description = "Application-layer security middleware for actix-web, powered by the guard-core-rs engine. Part of the guard ecosystem."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rennf93/actix-guard-rs"
+repository = "https://github.com/Guard-Core/actix-guard-rs"
 readme = "README.md"
 keywords = ["security", "middleware", "api", "actix", "actix-web"]
 categories = ["web-programming"]
@@ -32,9 +32,10 @@ guard-core-engine = { path = "../guard-core-rs/crates/guard-core-engine", versio
 # CI exercise it from source; the version pin stays in lockstep with the
 # published facade release.
 guard-core-rs = { path = "../guard-core-rs/crates/guard-core-rs", version = "4.3.1" }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 actix-web = { version = "4", features = ["macros"] }
 
 [lints.rust]
