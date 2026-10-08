@@ -251,6 +251,7 @@ pub use crate::response::{
 };
 pub use crate::service::GuardService;
 
+use guard_core_engine::cloud_provider::CloudIpTable;
 use std::sync::Arc;
 
 /// Reference default detection configuration.
@@ -393,6 +394,16 @@ impl core::fmt::Debug for BanState {
 /// The transform applies to every request routed after it. Wrapped services
 /// are shared through an `Rc` (see [`GuardService`]); actix Web builds its
 /// service tree per worker, so this is free and never crosses threads.
+/// The `agent_stats` answer (the reference middleware property shape):
+/// whether an agent is wired and whether its start degraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentStats {
+    /// Whether an agent handler is wired (`enabled`).
+    pub enabled: bool,
+    /// Whether the agent started with failures (`degraded`).
+    pub degraded: bool,
+}
+
 #[derive(Clone)]
 pub struct GuardTransform {
     config: DetectConfig,
@@ -444,6 +455,12 @@ pub struct GuardTransform {
     exclude_paths: Vec<String>,
     scan_fn: ScanFn,
     stage: Option<Arc<RateLimitStage>>,
+    /// The cloud-refresh seam the `refresh_cloud_ip_ranges` maintenance
+    /// call drives (the reference `refresh_cloud_ip_ranges`'s handler).
+    cloud_refresh: Option<(
+        Arc<guard_core_rs::geo_lifecycle::CloudRefreshScheduler>,
+        Arc<CloudIpTable>,
+    )>,
 }
 
 impl GuardTransform {
@@ -487,6 +504,7 @@ impl GuardTransform {
             exclude_paths: Vec::new(),
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             stage: None,
+            cloud_refresh: None,
         }
     }
 
@@ -1116,6 +1134,62 @@ impl GuardTransform {
         self
     }
 
+    /// Install the cloud-refresh seam the
+    /// [`GuardTransform::refresh_cloud_ip_ranges`] maintenance call
+    /// drives: the scheduler (the facade's `CloudRefreshScheduler`,
+    /// carrying the provider set and any endpoint overrides) plus the
+    /// table the refresh swaps ranges into - the same table the
+    /// cloud-provider stage consults (clones share the store).
+    #[must_use]
+    pub fn with_cloud_refresh_scheduler(
+        mut self,
+        scheduler: Arc<guard_core_rs::geo_lifecycle::CloudRefreshScheduler>,
+        table: Arc<CloudIpTable>,
+    ) -> Self {
+        self.cloud_refresh = Some((scheduler, table));
+        self
+    }
+
+    /// The reference `refresh_cloud_ip_ranges` (fastapi-guard
+    /// `guard/middleware.py`): schedule one background cloud-ranges
+    /// refresh through the installed scheduler (single-flight: `false`
+    /// while one is in flight, the reference's concurrent-caller gate).
+    /// No scheduler installed answers `false` - the reference's no-op for
+    /// an empty `block_cloud_providers`. The refreshed ranges land in the
+    /// shared table (each provider's row restamps), so the status payload
+    /// and the blocking stage see them without a restart.
+    #[must_use]
+    pub fn refresh_cloud_ip_ranges(&self) -> bool {
+        match &self.cloud_refresh {
+            Some((scheduler, table)) => scheduler.schedule_refresh(table),
+            None => false,
+        }
+    }
+
+    /// The reference `reset()` (fastapi-guard `guard/middleware.py`):
+    /// drop every rate-limit window the guard tracks, so every identity
+    /// starts its windows afresh. The bans, violation counts, and the
+    /// cloud table are untouched - the reference resets the rate-limit
+    /// handler only.
+    pub fn reset(&self) {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.reset();
+        }
+    }
+
+    /// The reference `agent_stats` (fastapi-guard `guard/middleware.py`
+    /// property) in its no-agent shape: `{"enabled": false, "degraded":
+    /// false}`. The adapter owns no agent slot (the engine-to-agent seam
+    /// lives in `guard-core-rs` / `guard-agent-rs`), so the enabled arm
+    /// has no surface here yet.
+    #[must_use]
+    pub const fn agent_stats(&self) -> AgentStats {
+        AgentStats {
+            enabled: false,
+            degraded: false,
+        }
+    }
+
     /// Install the blocked user-agent stage (check 14): a `User-Agent`
     /// matching the global blocklist (or the route's) answers `403`
     /// (`User-Agent not allowed`), and a detection threat on the same
@@ -1342,6 +1416,64 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_drops_every_rate_limit_window() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1,
+            rate_limit_window: 60,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let probe = limiter.clone();
+        let transform = GuardTransform::new(default_config()).with_rate_limiting(limiter);
+        let client: std::net::IpAddr = "203.0.113.9".parse().expect("ip");
+        assert!(probe.check(client, None).allowed);
+        assert!(!probe.check(client, None).allowed);
+        // The reference `reset()`: the same identity starts afresh.
+        transform.reset();
+        assert!(probe.check(client, None).allowed);
+    }
+
+    #[test]
+    fn refresh_cloud_ip_ranges_answers_false_without_a_scheduler() {
+        let transform = GuardTransform::new(default_config());
+        assert!(!transform.refresh_cloud_ip_ranges());
+    }
+
+    #[test]
+    fn refresh_cloud_ip_ranges_schedules_through_the_installed_seam() {
+        let scheduler = Arc::new(
+            guard_core_rs::geo_lifecycle::CloudRefreshScheduler::new()
+                .with_providers(vec!["AWS"])
+                .with_provider_endpoint("AWS", String::from("http://127.0.0.1:1/aws-ranges")),
+        );
+        let table = Arc::new(CloudIpTable::default());
+        let transform = GuardTransform::new(default_config())
+            .with_cloud_refresh_scheduler(Arc::clone(&scheduler), Arc::clone(&table));
+        // The schedule starts (the unroutable endpoint fails the fetch in
+        // the background thread, the single-flight gate clears when the
+        // body lands - the scheduler's own suite pins that).
+        assert!(transform.refresh_cloud_ip_ranges());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while scheduler.refresh_in_flight() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!scheduler.refresh_in_flight());
+    }
+
+    #[test]
+    fn agent_stats_answers_the_no_agent_shape() {
+        let transform = GuardTransform::new(default_config());
+        assert_eq!(
+            transform.agent_stats(),
+            AgentStats {
+                enabled: false,
+                degraded: false
+            }
+        );
+    }
 
     #[test]
     fn default_config_matches_corpus_knobs() {
