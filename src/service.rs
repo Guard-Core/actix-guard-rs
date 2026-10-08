@@ -462,6 +462,20 @@ where
                 ));
             }
 
+            // The country-verdict lines (the reference
+            // `_log_country_check_result`): the non-block verdicts ride
+            // `log_country_check_level`, blocks ride
+            // `log_suspicious_level` (compose-only, like check 4).
+            if let (Some(observability), Some(stage)) =
+                (transform.observability(), transform.geo_blocking())
+            {
+                let _ = stage.country_check_log(
+                    facts.ip,
+                    observability.log_suspicious_level,
+                    observability.log_country_check_level,
+                );
+            }
+
             // The reference runs the country arms inside the `ip`-gated
             // block: the same bypass skips the geo stage.
             if !bypassed("ip")
@@ -3091,6 +3105,74 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+
+    #[actix_web::test]
+    async fn the_log_level_knobs_feed_the_stage_surfaces() {
+        // `log_request_level` installs the request-logging stage; the
+        // country-verdict composer rides `log_country_check_level` off
+        // the observability config.
+        let config = SecurityConfig {
+            log_request_level: Some(guard_core_engine::security_config::LogLevel::Info),
+            log_country_check_level: Some(guard_core_engine::security_config::LogLevel::Debug),
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        assert!(
+            transform.request_logging().is_some(),
+            "the level installs the request-logging stage"
+        );
+        let observability = transform
+            .observability()
+            .expect("country level installs it");
+        assert_eq!(
+            observability.log_request_level,
+            Some(guard_core_rs::logging::LogLevel::Info)
+        );
+        assert_eq!(
+            observability.log_country_check_level,
+            Some(guard_core_rs::logging::LogLevel::Debug)
+        );
+
+        // The reference default: no request level (no stage), the
+        // country level at its INFO default (observability installs).
+        let transform =
+            GuardTransform::from_security_config(&SecurityConfig::default()).expect("valid");
+        assert!(transform.request_logging().is_none());
+        let observability = transform.observability().expect("the INFO country default");
+        assert_eq!(observability.log_request_level, None);
+        assert_eq!(
+            observability.log_country_check_level,
+            Some(guard_core_rs::logging::LogLevel::Info)
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_country_level_alone_installs_observability_and_composes() {
+        let config = SecurityConfig {
+            log_suspicious_level: None,
+            blocked_countries: [String::from("RU")].into_iter().collect(),
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let observability = transform.observability().expect("the country default");
+        assert_eq!(observability.log_suspicious_level, None);
+
+        // A dispatch through the geo position composes the verdict line
+        // (the geo stage is a host-provided collaborator).
+        let geo = guard_core_rs::geo::GeoStage::new(guard_core_rs::geo::GeoStageConfig {
+            gate: guard_core_engine::geo::parse_country_lists([] as [&str; 0], ["RU"]),
+            handler: None,
+            passive_mode: false,
+        });
+        let (status, _) = status_body(
+            GuardTransform::from_security_config(&config)
+                .expect("valid config")
+                .with_geo_blocking(geo),
+            config_request("203.0.113.9", "/hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
     #[actix_web::test]
     async fn from_security_config_defaults_screen_clean_traffic() {
         let config = SecurityConfig::default();
@@ -3396,6 +3478,9 @@ mod tests {
     fn from_security_config_silent_observability_skips_the_knob() {
         let config = SecurityConfig {
             log_suspicious_level: None,
+            // The INFO country default would install observability on
+            // its own; silence it too for the fully-silent surface.
+            log_country_check_level: None,
             ..SecurityConfig::default()
         };
         let transform = GuardTransform::from_security_config(&config).expect("valid config");
