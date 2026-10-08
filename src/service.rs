@@ -3032,6 +3032,41 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn from_security_config_feeds_the_scan_budgets() {
+        // The scan-budget knobs ride the unified config onto the scan
+        // path: a two-value budget stops the scan before the third
+        // value, so the threat in the last query param never surfaces.
+        let config = SecurityConfig {
+            detection_max_scan_values: 2,
+            ..SecurityConfig::default()
+        };
+        let (status, _) = status_body(
+            GuardTransform::from_security_config(&config).expect("valid config"),
+            config_request(
+                "203.0.113.9",
+                "/scan?a=benign-one&b=benign-two&c=1%20UNION%20SELECT%20password",
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "values past the scan-value budget are not scanned"
+        );
+
+        // The same request under the default budget scans (the
+        // below-threshold detection block, the family 400 shape).
+        let (status, _) = status_body(
+            GuardTransform::from_security_config(&SecurityConfig::default()).expect("valid config"),
+            config_request(
+                "203.0.113.9",
+                "/scan?a=benign-one&b=benign-two&c=1%20UNION%20SELECT%20password",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    #[actix_web::test]
     async fn from_security_config_defaults_screen_clean_traffic() {
         let config = SecurityConfig::default();
         let (status, _) = status_body(
