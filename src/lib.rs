@@ -453,6 +453,9 @@ pub struct GuardTransform {
     /// The response-side pass (behavioral return rules + security headers
     /// + CORS) applied to every response the guard touches.
     response_processor: Option<Arc<ResponseProcessor>>,
+    /// The reference `enable_penetration_detection`: the global scan
+    /// toggle (the reference default `true`).
+    penetration_detection_enabled: bool,
     /// The reference `exclude_paths`: request paths that bypass the whole
     /// pipeline (the docs/static carve-out).
     exclude_paths: Vec<String>,
@@ -505,6 +508,7 @@ impl GuardTransform {
             user_agent: None,
             response_processor: None,
             exclude_paths: Vec::new(),
+            penetration_detection_enabled: true,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             stage: None,
             cloud_refresh: None,
@@ -522,6 +526,21 @@ impl GuardTransform {
     #[must_use]
     pub fn exclude_paths(&self) -> &[String] {
         &self.exclude_paths
+    }
+
+    /// The global scan toggle (`enable_penetration_detection`, the
+    /// reference default `true`).
+    pub(crate) const fn penetration_detection_enabled(&self) -> bool {
+        self.penetration_detection_enabled
+    }
+
+    /// Set the global scan toggle (`enable_penetration_detection`): the
+    /// reference default is enabled, so only a `false` changes behavior -
+    /// the detection scan is skipped and the request proceeds clean.
+    #[must_use]
+    pub fn with_penetration_detection(mut self, enabled: bool) -> Self {
+        self.penetration_detection_enabled = enabled;
+        self
     }
 
     /// Set the `exclude_paths` carve-out.
@@ -563,6 +582,7 @@ impl GuardTransform {
             max_json_depth: config.detection_max_json_depth,
         })
         .with_passive_mode(config.passive_mode)
+        .with_penetration_detection(config.enable_penetration_detection)
         .with_exclude_paths(config.exclude_paths.clone());
 
         if config.whitelist.is_some()

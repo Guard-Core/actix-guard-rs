@@ -418,7 +418,9 @@ where
             // the pipeline stages that do. The reference
             // `suspicious_activity` bypass skips the scan (and with it the
             // violation feed) for the route.
-            let verdict = if bypassed("penetration") {
+            // The global `enable_penetration_detection` toggle skips the
+            // scan everywhere (the request proceeds clean).
+            let verdict = if bypassed("penetration") || !transform.penetration_detection_enabled() {
                 None
             } else {
                 match scan_request(&request, buffered.as_ref(), &transform) {
@@ -3031,6 +3033,29 @@ mod tests {
             .to_srv_request()
     }
 
+    #[actix_web::test]
+    async fn the_penetration_detection_toggle_skips_the_scan() {
+        // `enable_penetration_detection = false` skips the multi-surface
+        // scan entirely: the attack rides through clean (200).
+        let config = SecurityConfig {
+            enable_penetration_detection: false,
+            ..SecurityConfig::default()
+        };
+        let (status, _) = status_body(
+            GuardTransform::from_security_config(&config).expect("valid config"),
+            config_request("203.0.113.9", "/scan?q=1%20UNION%20SELECT%20password"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the toggle disables the scan");
+
+        // The default (enabled) scans and blocks.
+        let (status, _) = status_body(
+            GuardTransform::from_security_config(&SecurityConfig::default()).expect("valid config"),
+            config_request("203.0.113.9", "/scan?q=1%20UNION%20SELECT%20password"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
     #[actix_web::test]
     async fn from_security_config_feeds_the_scan_budgets() {
         // The scan-budget knobs ride the unified config onto the scan
