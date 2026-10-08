@@ -1,8 +1,8 @@
 site_name: actix-guard-rs
 site_description: Application-layer security middleware for actix-web, powered by the guard-core-rs detection engine
 site_author: Renn F
-repo_url: https://github.com/rennf93/actix-guard-rs
-repo_name: rennf93/actix-guard-rs
+repo_url: https://github.com/Guard-Core/actix-guard-rs
+repo_name: Guard-Core/actix-guard-rs
 
 theme:
   name: material
