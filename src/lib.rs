@@ -1282,10 +1282,6 @@ impl GuardTransform {
         self.user_agent.as_ref()
     }
 
-    pub(crate) const fn response_processor(&self) -> Option<&Arc<ResponseProcessor>> {
-        self.response_processor.as_ref()
-    }
-
     /// The installed engine stage (set by `Transform::new_transform`);
     /// every stateful decision and emission goes through it.
     pub(crate) fn stage(&self) -> Option<&RateLimitStage> {
