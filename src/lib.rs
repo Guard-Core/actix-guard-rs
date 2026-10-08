@@ -2,8 +2,8 @@
 //!
 //! Application-layer security middleware for
 //! [Actix Web](https://github.com/actix/actix-web) 4, powered by the
-//! [guard-core-rs](https://github.com/rennf93/guard-core-rs) detection
-//! engine. Part of the [Guard ecosystem](https://github.com/rennf93).
+//! [guard-core-rs](https://github.com/Guard-Core/guard-core-rs) detection
+//! engine. Part of the [Guard ecosystem](https://github.com/Guard-Core).
 //!
 //! ## Status: implemented (v0.1.0)
 //!
@@ -128,6 +128,24 @@
 //! | 17 `custom_request` | [`GuardTransform::with_custom_checks`] |
 //! | response pass (return rules + security headers + CORS) | [`GuardTransform::with_response_processor`] |
 //!
+//! ## The unified configuration surface
+//!
+//! [`GuardTransform::from_security_config`] builds the whole wired pipeline
+//! from the engine's [`SecurityConfig`] (the reference 129-field
+//! configuration surface) in one fail-closed call: the detection budgets,
+//! the IP lists onto the gate, the rate-limit and ban groups,
+//! `enforce_https`, `emergency_mode` + its whitelist,
+//! `custom_error_responses`/`on_block`, the detection-exclusion group, the
+//! observability group, the ReDoS-validated `blocked_user_agents`, and the
+//! security-headers/CORS/behavior response pass. The reference
+//! `exclude_paths` carve-out rides along as a first-class builder consumed
+//! first in the pipeline (an excluded path bypasses every request-side
+//! check, gate included). Invalid values fail closed through the typed
+//! [`GuardConfigError`]. The stages that need a host-provided collaborator
+//! (the geo handler, the distributed stores, the event bus, the custom
+//! checks, the time-window and referrer resolvers) stay opt-in through
+//! their own builders.
+//!
 //! These bodies follow the ecosystem's plain-text convention (the bare
 //! message, `text/plain; charset=utf-8`, same as the Python family) but
 //! the adapter is deliberately **fail-secure**, unlike the TypeScript
@@ -203,6 +221,10 @@ pub use guard_core_engine::rate_limit::{
     RateLimitConfig, RateLimitConfigError, RateLimitDecision, RateLimitEntry, RateLimitTier,
     RateLimiter, RouteRateLimits, TierDecision,
 };
+pub use guard_core_engine::route_config::{RouteConfig, RouteConfigResolver};
+pub use guard_core_engine::security_config::{
+    BufferOverflowPolicy, LogFormat, LogLevel, SecurityConfig, SecurityConfigError,
+};
 pub use guard_core_engine::security_headers::SecurityHeadersConfig;
 pub use guard_core_rs::cloud_provider::{CloudDecision, CloudProviderStage};
 pub use guard_core_rs::custom_checks::CustomChecksStage;
@@ -229,6 +251,7 @@ pub use crate::response::{
 };
 pub use crate::service::GuardService;
 
+use guard_core_engine::cloud_provider::CloudIpTable;
 use std::sync::Arc;
 
 /// Reference default detection configuration.
@@ -262,6 +285,81 @@ pub const fn default_config() -> DetectConfig {
         semantic_threshold: 0.7,
         threat_score_threshold: 1.0,
         binary_min_run_length: 16,
+        max_scan_values: 512,
+        max_scan_chars: 65_536,
+        max_json_depth: 32,
+    }
+}
+
+/// Why [`GuardTransform::from_security_config`] refused a value: the engine
+/// constructor that rejected it, fail-closed.
+#[derive(Debug)]
+pub enum GuardConfigError {
+    /// An IP/CIDR list entry the gate cannot parse.
+    IpGate(IpGateError),
+    /// A zero rate-limit knob.
+    RateLimit(RateLimitConfigError),
+    /// A blocked user-agent pattern the `ReDoS` validator rejected.
+    UserAgent(UserAgentConfigError),
+    /// An invalid auto-ban knob group.
+    Ban(IpBanConfigError),
+}
+
+impl std::fmt::Display for GuardConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IpGate(error) => write!(f, "ip list: {error}"),
+            Self::RateLimit(error) => write!(f, "rate limit: {error}"),
+            Self::UserAgent(error) => write!(f, "blocked user agent: {error}"),
+            Self::Ban(error) => write!(f, "ip ban: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GuardConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IpGate(error) => Some(error),
+            Self::RateLimit(error) => Some(error),
+            Self::UserAgent(error) => Some(error),
+            Self::Ban(error) => Some(error),
+        }
+    }
+}
+
+impl From<IpGateError> for GuardConfigError {
+    fn from(error: IpGateError) -> Self {
+        Self::IpGate(error)
+    }
+}
+
+impl From<RateLimitConfigError> for GuardConfigError {
+    fn from(error: RateLimitConfigError) -> Self {
+        Self::RateLimit(error)
+    }
+}
+
+impl From<UserAgentConfigError> for GuardConfigError {
+    fn from(error: UserAgentConfigError) -> Self {
+        Self::UserAgent(error)
+    }
+}
+
+impl From<IpBanConfigError> for GuardConfigError {
+    fn from(error: IpBanConfigError) -> Self {
+        Self::Ban(error)
+    }
+}
+
+/// The engine log level mapped onto the logging facade's enum (the
+/// reference literals are the same strings).
+fn map_log_level(level: LogLevel) -> guard_core_rs::logging::LogLevel {
+    match level {
+        LogLevel::Info => guard_core_rs::logging::LogLevel::Info,
+        LogLevel::Debug => guard_core_rs::logging::LogLevel::Debug,
+        LogLevel::Warning => guard_core_rs::logging::LogLevel::Warning,
+        LogLevel::Error => guard_core_rs::logging::LogLevel::Error,
+        LogLevel::Critical => guard_core_rs::logging::LogLevel::Critical,
     }
 }
 
@@ -299,6 +397,16 @@ impl core::fmt::Debug for BanState {
 /// The transform applies to every request routed after it. Wrapped services
 /// are shared through an `Rc` (see [`GuardService`]); actix Web builds its
 /// service tree per worker, so this is free and never crosses threads.
+/// The `agent_stats` answer (the reference middleware property shape):
+/// whether an agent is wired and whether its start degraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentStats {
+    /// Whether an agent handler is wired (`enabled`).
+    pub enabled: bool,
+    /// Whether the agent started with failures (`degraded`).
+    pub degraded: bool,
+}
+
 #[derive(Clone)]
 pub struct GuardTransform {
     config: DetectConfig,
@@ -307,10 +415,21 @@ pub struct GuardTransform {
     rate_limiter: Option<Arc<RateLimiter>>,
     ban_state: Option<Arc<BanState>>,
     route_tiers: Option<RouteRateResolver>,
+    /// The reference `RouteConfigResolver` (`(method, path) ->
+    /// Option<Arc<RouteConfig>>`): the per-route carrier the pipeline
+    /// consumes (bypassed checks, `require_https`, per-route UA and size
+    /// limits, the rate-limit and detection views). An
+    /// `Arc<RouteConfig>` request extension wins over the resolver.
+    route_configs: Option<RouteConfigResolver>,
     geo_handler: Option<Arc<dyn GeoIpHandler>>,
     events: Option<Arc<SecurityEventBus>>,
     observability: Option<ObservabilityConfig>,
     on_block: Option<OnBlockHook>,
+    /// The reference `custom_response_modifier`: mutates the response
+    /// view the response pass composes before it leaves the pipeline.
+    response_modifier: Option<guard_core_engine::payload::ResponseModifierFn>,
+    /// The reference `on_error` best-effort hook.
+    on_error: Option<guard_core_rs::responses::OnErrorHook>,
     custom_error_responses: CustomErrorResponses,
     passive_mode: bool,
     distributed: Option<(Arc<dyn SlidingWindowStore>, String, bool)>,
@@ -339,8 +458,20 @@ pub struct GuardTransform {
     /// The response-side pass (behavioral return rules + security headers
     /// + CORS) applied to every response the guard touches.
     response_processor: Option<Arc<ResponseProcessor>>,
+    /// The reference `enable_penetration_detection`: the global scan
+    /// toggle (the reference default `true`).
+    penetration_detection_enabled: bool,
+    /// The reference `exclude_paths`: request paths that bypass the whole
+    /// pipeline (the docs/static carve-out).
+    exclude_paths: Vec<String>,
     scan_fn: ScanFn,
     stage: Option<Arc<RateLimitStage>>,
+    /// The cloud-refresh seam the `refresh_cloud_ip_ranges` maintenance
+    /// call drives (the reference `refresh_cloud_ip_ranges`'s handler).
+    cloud_refresh: Option<(
+        Arc<guard_core_rs::geo_lifecycle::CloudRefreshScheduler>,
+        Arc<CloudIpTable>,
+    )>,
 }
 
 impl GuardTransform {
@@ -360,10 +491,13 @@ impl GuardTransform {
             rate_limiter: None,
             ban_state: None,
             route_tiers: None,
+            route_configs: None,
             geo_handler: None,
             events: None,
             observability: None,
             on_block: None,
+            response_modifier: None,
+            on_error: None,
             custom_error_responses: CustomErrorResponses::new(),
             passive_mode: false,
             distributed: None,
@@ -380,8 +514,11 @@ impl GuardTransform {
             cloud_provider: None,
             user_agent: None,
             response_processor: None,
+            exclude_paths: Vec::new(),
+            penetration_detection_enabled: true,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             stage: None,
+            cloud_refresh: None,
         }
     }
 
@@ -389,6 +526,257 @@ impl GuardTransform {
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(default_config())
+    }
+
+    /// The request paths that bypass the whole pipeline (the reference
+    /// `exclude_paths` carve-out, exact path match).
+    #[must_use]
+    pub fn exclude_paths(&self) -> &[String] {
+        &self.exclude_paths
+    }
+
+    /// The global scan toggle (`enable_penetration_detection`, the
+    /// reference default `true`).
+    pub(crate) const fn penetration_detection_enabled(&self) -> bool {
+        self.penetration_detection_enabled
+    }
+
+    /// Set the global scan toggle (`enable_penetration_detection`): the
+    /// reference default is enabled, so only a `false` changes behavior -
+    /// the detection scan is skipped and the request proceeds clean.
+    #[must_use]
+    pub fn with_penetration_detection(mut self, enabled: bool) -> Self {
+        self.penetration_detection_enabled = enabled;
+        self
+    }
+
+    /// Set the `exclude_paths` carve-out.
+    #[must_use]
+    pub fn with_exclude_paths(mut self, paths: Vec<String>) -> Self {
+        self.exclude_paths = paths;
+        self
+    }
+
+    /// Build the transform from the unified `SecurityConfig`
+    /// (the reference configuration surface): every field the transform
+    /// consumes maps onto the wired stage or knob it owns, in one place,
+    /// with the reference semantics - the same consumption the tower
+    /// adapter ships under `GuardLayer::from_security_config`.
+    ///
+    /// The stages that need a host-provided collaborator (the geo handler,
+    /// the distributed stores, the event bus, the custom checks, the
+    /// time-window and referrer resolvers) stay opt-in through their own
+    /// builders: the config carries no such object.
+    ///
+    /// # Errors
+    ///
+    /// [`GuardConfigError`] when an engine constructor rejects a value
+    /// (an invalid IP/CIDR list entry, a zero rate-limit knob, or a
+    /// ReDoS-unsafe blocked user-agent pattern).
+    #[allow(clippy::too_many_lines)]
+    pub fn from_security_config(
+        config: &guard_core_engine::security_config::SecurityConfig,
+    ) -> Result<Self, GuardConfigError> {
+        let mut transform = Self::new(DetectConfig {
+            max_content_length: config.detection_max_content_length,
+            max_full_scan_bytes: config.detection_max_body_inspect_bytes,
+            preserve_attack_patterns: config.detection_preserve_attack_patterns,
+            semantic_threshold: config.detection_semantic_threshold,
+            threat_score_threshold: config.detection_threat_score_threshold,
+            binary_min_run_length: config.detection_binary_min_run_length,
+            max_scan_values: config.detection_max_scan_values,
+            max_scan_chars: config.detection_max_scan_chars,
+            max_json_depth: config.detection_max_json_depth,
+        })
+        .with_passive_mode(config.passive_mode)
+        .with_penetration_detection(config.enable_penetration_detection)
+        .with_exclude_paths(config.exclude_paths.clone());
+
+        if config.whitelist.is_some()
+            || !config.blacklist.is_empty()
+            || !config.exempt_ips.is_empty()
+        {
+            transform = transform.with_ip_gate(guard_core_engine::ip_gate::IpGateConfig::new(
+                config.whitelist.clone().unwrap_or_default(),
+                config.blacklist.iter().cloned(),
+                config.exempt_ips.iter().cloned(),
+            )?);
+        }
+
+        if config.enable_rate_limiting {
+            let limiter = RateLimiter::new(RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: config.rate_limit,
+                rate_limit_window: config.rate_limit_window,
+                ..RateLimitConfig::default()
+            })?;
+            transform = transform.with_rate_limiting(limiter);
+        }
+
+        if config.enable_ip_banning {
+            transform = transform.with_ip_banning(IpBanManager::new(), config.ip_ban_config());
+        }
+
+        // Check 3: the global HTTPS arm; `X-Forwarded-Proto` trust rides
+        // the same knobs the reference reads them from.
+        transform = transform.with_https_enforcement(
+            HttpsEnforcementStage::builder(
+                guard_core_rs::https_enforcement::HttpsEnforcementStageConfig {
+                    enforce_https: config.enforce_https,
+                    trust_x_forwarded_proto: config.trust_x_forwarded_proto,
+                    passive_mode: config.passive_mode,
+                },
+            )
+            .build()?,
+        );
+
+        if config.emergency_mode || !config.emergency_whitelist.is_empty() {
+            transform = transform.with_emergency_mode(
+                EmergencyModeStage::builder(
+                    guard_core_rs::emergency_mode::EmergencyModeStageConfig {
+                        emergency_mode: config.emergency_mode,
+                        passive_mode: config.passive_mode,
+                    },
+                )
+                .emergency_whitelist(config.emergency_whitelist.iter().cloned())
+                .build()?,
+            );
+        }
+
+        if !config.custom_error_responses.is_empty() {
+            transform = transform.with_custom_error_responses(
+                config
+                    .custom_error_responses
+                    .iter()
+                    .map(|(status, body)| (*status, body.clone()))
+                    .collect(),
+            );
+        }
+
+        if let Some(hook) = config.on_block.clone() {
+            transform = transform.with_on_block(hook);
+        }
+
+        if !config.excluded_detection_headers.is_empty()
+            || !config.excluded_detection_params.is_empty()
+            || !config.excluded_detection_body_fields.is_empty()
+            || !config.enabled_detection_categories.is_empty()
+        {
+            transform = transform.with_detection_exclusions(DetectionExclusionConfig {
+                excluded_detection_headers: config
+                    .excluded_detection_headers
+                    .iter()
+                    .cloned()
+                    .collect(),
+                excluded_detection_params: config
+                    .excluded_detection_params
+                    .iter()
+                    .cloned()
+                    .collect(),
+                excluded_detection_body_fields: config
+                    .excluded_detection_body_fields
+                    .iter()
+                    .cloned()
+                    .collect(),
+                enabled_detection_categories: (!config.enabled_detection_categories.is_empty())
+                    .then(|| {
+                        config
+                            .enabled_detection_categories
+                            .iter()
+                            .cloned()
+                            .collect()
+                    }),
+                detection_scan_body: Some(config.detection_scan_body),
+            });
+        }
+
+        if let Some(level) = config.log_request_level {
+            // The reference construction gate: the request-logging check
+            // exists only when `log_request_level` is set.
+            transform = transform.with_request_logging(RequestLoggingStage::new(
+                RequestLoggingStageConfig {
+                    log_request_level: Some(map_log_level(level)),
+                    muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
+                    sensitive: guard_core_rs::redact::SensitiveNames::new(
+                        Some(&config.log_sensitive_headers.iter().cloned().collect()),
+                        Some(&config.log_sensitive_params.iter().cloned().collect()),
+                        Some(&config.log_sensitive_body_fields.iter().cloned().collect()),
+                    ),
+                },
+            ));
+        }
+
+        if let Some(level) = config.log_suspicious_level {
+            transform = transform.with_observability(ObservabilityConfig {
+                log_suspicious_level: Some(map_log_level(level)),
+                log_request_level: config.log_request_level.map(map_log_level),
+                log_country_check_level: config.log_country_check_level.map(map_log_level),
+                muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
+                sensitive: guard_core_rs::redact::SensitiveNames::new(
+                    Some(&config.log_sensitive_headers.iter().cloned().collect()),
+                    Some(&config.log_sensitive_params.iter().cloned().collect()),
+                    Some(&config.log_sensitive_body_fields.iter().cloned().collect()),
+                ),
+            });
+        } else if let Some(country_level) = config.log_country_check_level {
+            // Country verdicts compose even without a suspicious level.
+            transform = transform.with_observability(ObservabilityConfig {
+                log_suspicious_level: None,
+                log_request_level: config.log_request_level.map(map_log_level),
+                log_country_check_level: Some(map_log_level(country_level)),
+                muted_check_logs: Some(config.muted_check_logs.iter().cloned().collect()),
+                sensitive: guard_core_rs::redact::SensitiveNames::new(
+                    Some(&config.log_sensitive_headers.iter().cloned().collect()),
+                    Some(&config.log_sensitive_params.iter().cloned().collect()),
+                    Some(&config.log_sensitive_body_fields.iter().cloned().collect()),
+                ),
+            });
+        }
+
+        if !config.blocked_user_agents.is_empty() {
+            transform = transform.with_user_agent(
+                UserAgentStage::builder(guard_core_rs::user_agent::UserAgentStageConfig {
+                    // The error arm takes its own line: the coverage
+                    // mapping attributes the `?` return to the function
+                    // exit, so an inline `?` here renders count 0 forever.
+                    blocked_user_agents: guard_core_engine::user_agent::UserAgentFilter::new(
+                        config.blocked_user_agents.iter().cloned(),
+                    )
+                    .map_err(GuardConfigError::from)?,
+                    ip_ban: config.ip_ban_config(),
+                    passive_mode: config.passive_mode,
+                })
+                .build()?,
+            );
+        }
+
+        let wants_headers = config.security_headers.enabled;
+        if wants_headers || config.enable_cors || !config.global_behavior_rules.is_empty() {
+            let cors = config
+                .enable_cors
+                .then(|| guard_core_engine::cors::CorsConfig {
+                    enabled: true,
+                    allow_origins: config.cors_allow_origins.clone(),
+                    allow_methods: config.cors_allow_methods.clone(),
+                    allow_headers: config.cors_allow_headers.clone(),
+                    allow_credentials: config.cors_allow_credentials,
+                    max_age: config.cors_max_age,
+                });
+            transform = transform.with_response_processor(ResponseProcessor::new(
+                wants_headers.then_some(config.security_headers.clone()),
+                cors,
+                config.global_behavior_rules.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    guard_core_engine::behavior::BehaviorTracker::new(),
+                )),
+                IpBanManager::new(),
+                config.behavior_scan_response_body,
+                config.behavior_max_response_body_inspect_bytes,
+                config.passive_mode,
+            ));
+        }
+
+        Ok(transform)
     }
 
     /// Replace the body buffering cap, in bytes.
@@ -571,6 +959,30 @@ impl GuardTransform {
         self
     }
 
+    /// Install the reference `RouteConfigResolver` (the
+    /// [`RouteConfig`] carrier): `(method, path) -> Option<Arc<RouteConfig>>`.
+    /// The resolved route's knobs apply on top of the global config for
+    /// that route only, the reference `RouteConfigResolver` semantics:
+    /// `bypassed_checks` (and the `"all"` wildcard) skip the named
+    /// reference checks for the route, `require_https` forces the
+    /// reference `301`, `max_request_size` replaces the body cap,
+    /// `blocked_user_agents` is evaluated additively before the global
+    /// filter, the rate-limit group becomes the route's tier, and the
+    /// detection-exclusion group resolves through the engine's detection
+    /// view. An `Arc<RouteConfig>` request extension wins over the
+    /// resolver (the app attaches a route's config directly, the
+    /// reference `request.state.route_config` idiom).
+    #[must_use]
+    pub fn with_route_configs(mut self, resolver: RouteConfigResolver) -> Self {
+        self.route_configs = Some(resolver);
+        self
+    }
+
+    /// The installed route-config resolver, if any.
+    pub(crate) const fn route_configs(&self) -> Option<&RouteConfigResolver> {
+        self.route_configs.as_ref()
+    }
+
     /// Install the geolocation seam the geo rate-limit tier resolves
     /// through (`geo_handler.get_country(ip)`; the MMDB reading is the
     /// host's work, [`GeoIpHandler`] is the engine trait). Without a
@@ -584,7 +996,13 @@ impl GuardTransform {
 
     /// Install the [`SecurityEventBus`] the stage's security events
     /// dispatch through (`penetration_attempt`, `rate_limited`,
-    /// `ip_banned`, with the reference fields and metadata). Handlers
+    /// `ip_banned`, with the reference fields and metadata). The
+    /// response-side pass joins the stream: when the security-header set
+    /// lands on a forwarded response, the composed
+    /// `security_headers_applied` event (action `headers_added`, the
+    /// display-redacted path plus `headers_count`/`has_csp`/`has_hsts`)
+    /// dispatches too; guard-generated answers apply the headers without
+    /// firing (the reference's `create_error_response` lane). Handlers
     /// receive every event and own the transport.
     #[must_use]
     pub fn with_event_bus(mut self, bus: Arc<SecurityEventBus>) -> Self {
@@ -614,6 +1032,29 @@ impl GuardTransform {
     #[must_use]
     pub fn with_on_block(mut self, hook: OnBlockHook) -> Self {
         self.on_block = Some(hook);
+        self
+    }
+
+    /// Install the reference `custom_response_modifier`: the callback
+    /// runs LAST in the response pass (after the CORS verdict) over the
+    /// response view every guard-rendered answer composes. A panicking
+    /// callback leaves the view unmodified (the reference's except arm)
+    /// and reports through the `on_error` hook when one is installed.
+    #[must_use]
+    pub fn with_custom_response_modifier(
+        mut self,
+        modifier: guard_core_engine::payload::ResponseModifierFn,
+    ) -> Self {
+        self.response_modifier = Some(modifier);
+        self
+    }
+
+    /// Install the reference `on_error` best-effort hook: invoked when a
+    /// middleware step fails, receiving `(stage, error, context)`. A
+    /// raising callback is caught and dropped, never propagated.
+    #[must_use]
+    pub fn with_on_error(mut self, hook: guard_core_rs::responses::OnErrorHook) -> Self {
+        self.on_error = Some(hook);
         self
     }
 
@@ -787,6 +1228,62 @@ impl GuardTransform {
         self
     }
 
+    /// Install the cloud-refresh seam the
+    /// [`GuardTransform::refresh_cloud_ip_ranges`] maintenance call
+    /// drives: the scheduler (the facade's `CloudRefreshScheduler`,
+    /// carrying the provider set and any endpoint overrides) plus the
+    /// table the refresh swaps ranges into - the same table the
+    /// cloud-provider stage consults (clones share the store).
+    #[must_use]
+    pub fn with_cloud_refresh_scheduler(
+        mut self,
+        scheduler: Arc<guard_core_rs::geo_lifecycle::CloudRefreshScheduler>,
+        table: Arc<CloudIpTable>,
+    ) -> Self {
+        self.cloud_refresh = Some((scheduler, table));
+        self
+    }
+
+    /// The reference `refresh_cloud_ip_ranges` (fastapi-guard
+    /// `guard/middleware.py`): schedule one background cloud-ranges
+    /// refresh through the installed scheduler (single-flight: `false`
+    /// while one is in flight, the reference's concurrent-caller gate).
+    /// No scheduler installed answers `false` - the reference's no-op for
+    /// an empty `block_cloud_providers`. The refreshed ranges land in the
+    /// shared table (each provider's row restamps), so the status payload
+    /// and the blocking stage see them without a restart.
+    #[must_use]
+    pub fn refresh_cloud_ip_ranges(&self) -> bool {
+        match &self.cloud_refresh {
+            Some((scheduler, table)) => scheduler.schedule_refresh(table),
+            None => false,
+        }
+    }
+
+    /// The reference `reset()` (fastapi-guard `guard/middleware.py`):
+    /// drop every rate-limit window the guard tracks, so every identity
+    /// starts its windows afresh. The bans, violation counts, and the
+    /// cloud table are untouched - the reference resets the rate-limit
+    /// handler only.
+    pub fn reset(&self) {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.reset();
+        }
+    }
+
+    /// The reference `agent_stats` (fastapi-guard `guard/middleware.py`
+    /// property) in its no-agent shape: `{"enabled": false, "degraded":
+    /// false}`. The adapter owns no agent slot (the engine-to-agent seam
+    /// lives in `guard-core-rs` / `guard-agent-rs`), so the enabled arm
+    /// has no surface here yet.
+    #[must_use]
+    pub const fn agent_stats(&self) -> AgentStats {
+        AgentStats {
+            enabled: false,
+            degraded: false,
+        }
+    }
+
     /// Install the blocked user-agent stage (check 14): a `User-Agent`
     /// matching the global blocklist (or the route's) answers `403`
     /// (`User-Agent not allowed`), and a detection threat on the same
@@ -876,10 +1373,6 @@ impl GuardTransform {
 
     pub(crate) const fn user_agent(&self) -> Option<&UserAgentStage> {
         self.user_agent.as_ref()
-    }
-
-    pub(crate) const fn response_processor(&self) -> Option<&Arc<ResponseProcessor>> {
-        self.response_processor.as_ref()
     }
 
     /// The installed engine stage (set by `Transform::new_transform`);
@@ -1015,6 +1508,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reset_drops_every_rate_limit_window() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1,
+            rate_limit_window: 60,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let probe = limiter.clone();
+        let transform = GuardTransform::new(default_config()).with_rate_limiting(limiter);
+        let client: std::net::IpAddr = "203.0.113.9".parse().expect("ip");
+        assert!(probe.check(client, None).allowed);
+        assert!(!probe.check(client, None).allowed);
+        // The reference `reset()`: the same identity starts afresh.
+        transform.reset();
+        assert!(probe.check(client, None).allowed);
+    }
+
+    #[test]
+    fn refresh_cloud_ip_ranges_answers_false_without_a_scheduler() {
+        let transform = GuardTransform::new(default_config());
+        assert!(!transform.refresh_cloud_ip_ranges());
+    }
+
+    #[test]
+    fn refresh_cloud_ip_ranges_schedules_through_the_installed_seam() {
+        let scheduler = Arc::new(
+            guard_core_rs::geo_lifecycle::CloudRefreshScheduler::new()
+                .with_providers(vec!["AWS"])
+                .with_provider_endpoint("AWS", String::from("http://127.0.0.1:1/aws-ranges")),
+        );
+        let table = Arc::new(CloudIpTable::default());
+        let transform = GuardTransform::new(default_config())
+            .with_cloud_refresh_scheduler(Arc::clone(&scheduler), Arc::clone(&table));
+        // The schedule starts (the unroutable endpoint fails the fetch in
+        // the background thread, the single-flight gate clears when the
+        // body lands - the scheduler's own suite pins that).
+        assert!(transform.refresh_cloud_ip_ranges());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while scheduler.refresh_in_flight() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!scheduler.refresh_in_flight());
+    }
+
+    #[test]
+    fn agent_stats_answers_the_no_agent_shape() {
+        let transform = GuardTransform::new(default_config());
+        assert_eq!(
+            transform.agent_stats(),
+            AgentStats {
+                enabled: false,
+                degraded: false
+            }
+        );
+    }
+
+    #[test]
     fn default_config_matches_corpus_knobs() {
         let config = default_config();
         assert_eq!(config.max_content_length, 10_000);
@@ -1066,5 +1617,90 @@ mod tests {
     /// The empty `threat_ban_config`, typed so the `new` calls stay inferable.
     fn no_entries() -> Vec<(String, ThreatBanEntry)> {
         Vec::new()
+    }
+
+    #[test]
+    fn from_security_config_exclude_paths_round_trip_through_the_accessor() {
+        let config = SecurityConfig {
+            exclude_paths: vec![String::from("/docs")],
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        assert_eq!(transform.exclude_paths(), ["/docs"]);
+    }
+
+    #[test]
+    fn from_security_config_user_agent_stage_is_wired() {
+        let config = SecurityConfig {
+            blocked_user_agents: vec![String::from("bad-bot")],
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        assert!(transform.user_agent().is_some());
+    }
+
+    #[test]
+    fn with_exclude_paths_round_trips_through_the_accessor() {
+        let transform = GuardTransform::new(default_config())
+            .with_exclude_paths(vec![String::from("/docs"), String::from("/static")]);
+        assert_eq!(transform.exclude_paths(), ["/docs", "/static"]);
+    }
+
+    #[test]
+    fn guard_config_error_display_and_source_cover_every_variant() {
+        let ip_gate: GuardConfigError = IpGateError {
+            list: "whitelist",
+            entry: String::from("nope"),
+        }
+        .into();
+        assert!(ip_gate.to_string().contains("ip list"));
+        assert!(std::error::Error::source(&ip_gate).is_some());
+
+        let rate_limit: GuardConfigError = RateLimitConfigError {
+            field: std::borrow::Cow::Borrowed("rate_limit"),
+            reason: "must be at least 1",
+        }
+        .into();
+        assert!(rate_limit.to_string().contains("rate limit"));
+        assert!(std::error::Error::source(&rate_limit).is_some());
+
+        let user_agent: GuardConfigError = UserAgentConfigError {
+            entry: String::from("bad-bot"),
+            reason: String::from("rejected"),
+        }
+        .into();
+        assert!(user_agent.to_string().contains("blocked user agent"));
+        assert!(std::error::Error::source(&user_agent).is_some());
+
+        let ban: GuardConfigError = IpBanConfigError::NonPositive {
+            field: "auto_ban_threshold",
+        }
+        .into();
+        assert!(ban.to_string().contains("ip ban"));
+        assert!(std::error::Error::source(&ban).is_some());
+    }
+
+    #[test]
+    fn map_log_level_covers_every_reference_level() {
+        assert!(matches!(
+            map_log_level(LogLevel::Info),
+            guard_core_rs::logging::LogLevel::Info
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Debug),
+            guard_core_rs::logging::LogLevel::Debug
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Warning),
+            guard_core_rs::logging::LogLevel::Warning
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Error),
+            guard_core_rs::logging::LogLevel::Error
+        ));
+        assert!(matches!(
+            map_log_level(LogLevel::Critical),
+            guard_core_rs::logging::LogLevel::Critical
+        ));
     }
 }

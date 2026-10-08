@@ -528,7 +528,10 @@ async fn custom_validators_block_with_the_validator_response() {
                     String::from("post_only"),
                     Arc::new(|ctx: &ActixValidatorContext<'_>| {
                         (ctx.method != "POST").then_some(ValidatorAnswer::Response(
-                            CustomResponse { status: Some(403) },
+                            CustomResponse {
+                                status: Some(403),
+                                body: None,
+                            },
                         ))
                     }) as ActixValidatorFn,
                 )]
@@ -670,7 +673,12 @@ async fn custom_request_blocks_with_the_function_response() {
     let stage = CustomChecksStage::builder()
         .custom_request(
             "maintenance_gate",
-            Arc::new(|ctx| (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })),
+            Arc::new(|ctx| {
+                (ctx.path == "/admin").then_some(CustomResponse {
+                    status: Some(503),
+                    body: None,
+                })
+            }),
         )
         .build();
     let guard = GuardTransform::new(default_config())
