@@ -696,6 +696,7 @@ impl GuardTransform {
                     allow_methods: config.cors_allow_methods.clone(),
                     allow_headers: config.cors_allow_headers.clone(),
                     allow_credentials: config.cors_allow_credentials,
+                    max_age: config.cors_max_age,
                 });
             transform = transform.with_response_processor(ResponseProcessor::new(
                 wants_headers.then_some(config.security_headers.clone()),
