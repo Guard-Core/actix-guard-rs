@@ -924,6 +924,26 @@ fn compute_processor_headers(
         origin: origin.map(ToOwned::to_owned),
     };
     let _action = processor.process(&request, &mut bits, None, SystemTime::now());
+
+    // The reference `custom_response_modifier`: the callback runs LAST
+    // over the response view. A panicking callback restores the
+    // unmodified view (the reference's except arm) and reports through
+    // the `on_error` hook.
+    if let Some(modifier) = &transform.response_modifier {
+        let unmodified = bits.clone();
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| modifier(&mut bits)));
+        if outcome.is_err() {
+            bits = unmodified;
+            if let Some(hook) = &transform.on_error {
+                hook(
+                    "custom_response_modifier",
+                    "the response modifier panicked; returning unmodified response",
+                    &[("path".to_owned(), url_path.to_owned())],
+                );
+            }
+        }
+    }
     let mut headers = actix_web::http::header::HeaderMap::new();
     for (name, value) in bits.headers {
         #[cfg(not(coverage))] // unreachable: the processor renders the
@@ -3037,6 +3057,21 @@ mod tests {
     use guard_core_engine::security_config::SecurityConfig;
     use guard_core_rs::responses::OnBlockHook;
 
+    fn bare_processor() -> guard_core_rs::process_response::ResponseProcessor {
+        guard_core_rs::process_response::ResponseProcessor::new(
+            Some(guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()),
+            None,
+            Vec::new(),
+            Arc::new(std::sync::Mutex::new(
+                guard_core_engine::behavior::BehaviorTracker::new(),
+            )),
+            IpBanManager::new(),
+            false,
+            guard_core_engine::behavior::DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+            false,
+        )
+    }
+
     fn config_request(ip: &str, uri: &str) -> ServiceRequest {
         TestRequest::get()
             .uri(uri)
@@ -3173,6 +3208,56 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
     }
+    #[actix_web::test]
+    async fn the_response_modifier_mutates_the_response_view() {
+        // The reference `custom_response_modifier`: the callback runs
+        // last over the response view - a header lands on the composed
+        // answer.
+        let transform = GuardTransform::new(default_config())
+            .with_response_processor(bare_processor())
+            .with_custom_response_modifier(Arc::new(|bits: &mut ResponseBits| {
+                bits.headers
+                    .insert("X-Modified-By".to_owned(), "guard".to_owned());
+            }));
+        let headers =
+            compute_processor_headers(&transform, "GET", "/hello", "203.0.113.9", None, 200)
+                .expect("headers");
+        assert_eq!(
+            headers
+                .get("x-modified-by")
+                .and_then(|value| value.to_str().ok()),
+            Some("guard"),
+            "the modifier lands on the response view"
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_panicking_response_modifier_restores_and_reports() {
+        let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let transform = GuardTransform::new(default_config())
+            .with_response_processor(bare_processor())
+            .with_custom_response_modifier(Arc::new(|_bits: &mut ResponseBits| {
+                panic!("modifier exploded");
+            }))
+            .with_on_error(Arc::new(move |stage, error, _context| {
+                sink.lock()
+                    .expect("sink")
+                    .push((stage.to_owned(), error.to_owned()));
+            }));
+        let headers =
+            compute_processor_headers(&transform, "GET", "/hello", "203.0.113.9", None, 200)
+                .expect("headers");
+        assert!(
+            headers.get("x-content-type-options").is_some(),
+            "the security headers survive the panicking modifier"
+        );
+        let seen = seen.lock().expect("sink");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "custom_response_modifier");
+    }
+
     #[actix_web::test]
     async fn from_security_config_defaults_screen_clean_traffic() {
         let config = SecurityConfig::default();

@@ -425,6 +425,11 @@ pub struct GuardTransform {
     events: Option<Arc<SecurityEventBus>>,
     observability: Option<ObservabilityConfig>,
     on_block: Option<OnBlockHook>,
+    /// The reference `custom_response_modifier`: mutates the response
+    /// view the response pass composes before it leaves the pipeline.
+    response_modifier: Option<guard_core_engine::payload::ResponseModifierFn>,
+    /// The reference `on_error` best-effort hook.
+    on_error: Option<guard_core_rs::responses::OnErrorHook>,
     custom_error_responses: CustomErrorResponses,
     passive_mode: bool,
     distributed: Option<(Arc<dyn SlidingWindowStore>, String, bool)>,
@@ -491,6 +496,8 @@ impl GuardTransform {
             events: None,
             observability: None,
             on_block: None,
+            response_modifier: None,
+            on_error: None,
             custom_error_responses: CustomErrorResponses::new(),
             passive_mode: false,
             distributed: None,
@@ -1019,6 +1026,29 @@ impl GuardTransform {
     #[must_use]
     pub fn with_on_block(mut self, hook: OnBlockHook) -> Self {
         self.on_block = Some(hook);
+        self
+    }
+
+    /// Install the reference `custom_response_modifier`: the callback
+    /// runs LAST in the response pass (after the CORS verdict) over the
+    /// response view every guard-rendered answer composes. A panicking
+    /// callback leaves the view unmodified (the reference's except arm)
+    /// and reports through the `on_error` hook when one is installed.
+    #[must_use]
+    pub fn with_custom_response_modifier(
+        mut self,
+        modifier: guard_core_engine::payload::ResponseModifierFn,
+    ) -> Self {
+        self.response_modifier = Some(modifier);
+        self
+    }
+
+    /// Install the reference `on_error` best-effort hook: invoked when a
+    /// middleware step fails, receiving `(stage, error, context)`. A
+    /// raising callback is caught and dropped, never propagated.
+    #[must_use]
+    pub fn with_on_error(mut self, hook: guard_core_rs::responses::OnErrorHook) -> Self {
+        self.on_error = Some(hook);
         self
     }
 
