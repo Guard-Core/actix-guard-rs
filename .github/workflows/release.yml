@@ -52,6 +52,13 @@ jobs:
           components: rustfmt, clippy
           rustflags: ""
 
+      # The engine's ReDoS validator spawns the pattern-probe child over the
+      # workspace target dir, and cargo test does not build dependency bins -
+      # without this the user-agent patterns fail secure at the tag (the
+      # guard-core-rs 4ab7f95 fix, adapter side; ci.yml already carries it).
+      - name: Build the pattern-probe child
+        run: cargo build -p guard-core-engine --bins
+
       - name: cargo fmt check
         run: cargo fmt --all -- --check
 
