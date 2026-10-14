@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-engine"
-version = "4.3.2"
+version = "4.3.3"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-rs"
-version = "4.3.2"
+version = "4.3.3"
 dependencies = [
  "chrono",
  "guard-core-engine",
