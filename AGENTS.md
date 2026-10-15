@@ -26,7 +26,7 @@ Downstream consumers register `GuardTransform` with `App::wrap` (or wrap any `Se
 ## Boundary Rules
 
 - **No security logic in this crate.** Detection comes from `guard-core-engine`'s `detect`. Policy values (thresholds, caps) are configuration, not logic.
-- **No other framework dependencies.** This crate depends on `actix-web`, `bytes`, `futures-core`, and the engine. Never add `axum`, `hyper`, `tower`, `rocket`, or a tokio runtime dependency to `[dependencies]`.
+- **No other framework dependencies.** This crate depends on `actix-web`, `bytes`, `futures-core`, and the engine. Never add `axum`, `hyper`, `tower` or `rocket` to `[dependencies]`. The only runtime-handle dependency is the optional `tokio` behind the `agent` feature (guard-agent-rs needs a handle); the request-path timers use `actix_web::rt`.
 - **No modifications to the engine.** Engine behavior changes are `guard-core-rs` PRs.
 - **Fail-secure, always.** A body read error, an engine panic, or a body over the cap must never result in an uninspected passthrough. Failures answer `500` (or `413` for oversize).
 

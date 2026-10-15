@@ -148,11 +148,22 @@
 //! `on_error`, `cors_expose_headers`, `trusted_proxies` (the HTTPS stage,
 //! the ban engine and the client policy), the telemetry and event bus,
 //! `enable_dynamic_rules`, and `enable_redis` (when `guard-core-rs` is built
-//! with its `redis` feature). Invalid values fail closed through the typed
-//! [`GuardConfigError`]. The stages that need a host-provided collaborator
-//! (the time-window and referrer resolvers, the route carrier) stay opt-in
-//! through their own builders, and the telemetry agent is injected with
+//! with its `redis` feature, forwarded by this crate's `redis` feature).
+//! The config is validated first and invalid values fail closed through the
+//! typed [`GuardConfigError`]. The stages that need a host-provided
+//! collaborator (the time-window and referrer resolvers, the route carrier)
+//! stay opt-in through their own builders. The telemetry agent is built from
+//! the `agent_*` fields with the `agent` feature, or injected with
 //! [`GuardTransform::from_security_config_with`].
+//!
+//! The stages a dynamic rule can change (country, cloud, user agent,
+//! emergency mode, the detection toggle, the rate-limit and ban knobs) are
+//! read from the live config on every request. `route_resolution_strict`
+//! answers `500 Route resolution failed` for a request no registered actix
+//! resource matches, and `body_read_timeout` answers `408 Request body read
+//! timed out` for a request body that does not arrive in time. The route's
+//! usage rules run after the whole pipeline passed, so a blocked or
+//! unattributed request is not counted.
 //!
 //! ## Client resolution
 //!
@@ -200,8 +211,10 @@
 //! ## Agent, metrics and dynamic rules
 //!
 //! The adapter takes the telemetry sink through the facade's
-//! [`TelemetryHandler`] trait; build one from the `agent_*` fields with
-//! guard-agent-rs's `GuardAgentTelemetry` and pass it as
+//! [`TelemetryHandler`] trait; with the `agent` feature
+//! [`GuardTransform::from_security_config`] builds one from the `agent_*`
+//! fields (a failure degrades, see [`GuardTransform::agent_stats`], unless
+//! `agent_strict`), or pass your own as
 //! `WiringOptions { agent: Some(..), logfire_client: None }` to
 //! [`GuardTransform::from_security_config_with`]. The agent then feeds the
 //! event bus, the metrics collector, [`GuardTransform::agent_stats`] and the
@@ -254,6 +267,8 @@
 //! # });
 //! ```
 
+#[cfg(feature = "agent")]
+mod agent;
 mod response;
 mod service;
 
@@ -303,6 +318,7 @@ pub use guard_core_rs::headers_auth::{
 pub use guard_core_rs::https_enforcement::{
     HttpsEnforcementStage, HttpsRedirectAnswer as HttpsRedirect,
 };
+pub use guard_core_rs::live::{LiveCell, LiveContext, LiveStages};
 pub use guard_core_rs::metrics::MetricsCollector;
 pub use guard_core_rs::process_response::ResponseProcessor;
 pub use guard_core_rs::request_logging::{RequestLoggingStage, RequestLoggingStageConfig};
@@ -333,6 +349,23 @@ use std::time::Duration;
 /// can read it with `request.extensions().get::<GuardExclusionScoped>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuardExclusionScoped;
+
+/// The two switches the live-config parity work added to the transform.
+#[derive(Clone, Copy, Default)]
+struct ParityFlags {
+    /// `route_resolution_strict`.
+    route_resolution_strict: bool,
+    /// The agent init failed and `agent_strict` was off (the reference
+    /// `agent_degraded`).
+    agent_degraded: bool,
+}
+
+/// What the live config rebuilds for this transform: the engine stages a
+/// dynamic rule can change plus the rate-limit stage built over them.
+pub(crate) struct ActixLive {
+    pub(crate) stages: Arc<LiveStages>,
+    pub(crate) rate_stage: RateLimitStage,
+}
 
 /// Reference default detection configuration.
 ///
@@ -390,6 +423,12 @@ pub enum GuardConfigError {
     /// Country rules without a resolver, or the `GeoIP` database could not
     /// be set up.
     Geo(String),
+    /// [`SecurityConfig::validate`] rejected the config (the reference
+    /// validates at construction).
+    Config(SecurityConfigError),
+    /// `enable_agent` with `agent_strict` and the agent could not be built
+    /// from the `agent_*` fields (the `agent` feature).
+    Agent(String),
 }
 
 impl std::fmt::Display for GuardConfigError {
@@ -402,6 +441,8 @@ impl std::fmt::Display for GuardConfigError {
             Self::Cloud(error) => write!(f, "block_cloud_providers: {error}"),
             Self::Redis(message) => write!(f, "redis: {message}"),
             Self::Geo(message) => write!(f, "geo: {message}"),
+            Self::Config(error) => write!(f, "config: {}", error.problems.join("; ")),
+            Self::Agent(message) => write!(f, "agent: {message}"),
         }
     }
 }
@@ -414,7 +455,8 @@ impl std::error::Error for GuardConfigError {
             Self::UserAgent(error) => Some(error),
             Self::Ban(error) => Some(error),
             Self::Cloud(error) => Some(error),
-            Self::Redis(_) | Self::Geo(_) => None,
+            Self::Config(error) => Some(error),
+            Self::Redis(_) | Self::Geo(_) | Self::Agent(_) => None,
         }
     }
 }
@@ -453,6 +495,7 @@ impl From<WiringError> for GuardConfigError {
             WiringError::Cloud(error) => Self::Cloud(error),
             WiringError::Redis(message) => Self::Redis(message),
             WiringError::Geo(message) => Self::Geo(message),
+            WiringError::Config(error) => Self::Config(error),
         }
     }
 }
@@ -578,6 +621,14 @@ pub struct GuardTransform {
     body_read_timeout: Option<Duration>,
     scan_fn: ScanFn,
     stage: Option<Arc<RateLimitStage>>,
+    /// The live-config cell (a transform built from a `SecurityConfig`): the
+    /// stages a dynamic rule can change, rebuilt when a rule lands.
+    live: Option<Arc<LiveCell<ActixLive>>>,
+    /// The cell's value for the request in flight (set per request by
+    /// [`GuardTransform::refresh_live`]; the stage accessors read it first).
+    live_now: Option<Arc<ActixLive>>,
+    /// `route_resolution_strict` and the degraded-agent flag.
+    parity: ParityFlags,
     /// The cloud-refresh seam the `refresh_cloud_ip_ranges` maintenance
     /// call drives (the reference `refresh_cloud_ip_ranges`'s handler).
     cloud_refresh: Option<(
@@ -641,6 +692,9 @@ impl GuardTransform {
             penetration_detection_enabled: true,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
             stage: None,
+            live: None,
+            live_now: None,
+            parity: ParityFlags::default(),
             cloud_refresh: None,
         }
     }
@@ -661,8 +715,12 @@ impl GuardTransform {
 
     /// The global scan toggle (`enable_penetration_detection`, the
     /// reference default `true`).
-    pub(crate) const fn penetration_detection_enabled(&self) -> bool {
-        self.penetration_detection_enabled
+    pub(crate) fn penetration_detection_enabled(&self) -> bool {
+        self.live_now
+            .as_ref()
+            .map_or(self.penetration_detection_enabled, |live| {
+                live.stages.penetration_detection
+            })
     }
 
     /// Set the global scan toggle (`enable_penetration_detection`): the
@@ -764,11 +822,31 @@ impl GuardTransform {
         self
     }
 
-    /// Bound the response-body read the `return_pattern` body rules need
-    /// (`body_read_timeout`). A body that does not arrive in time answers
-    /// the fail-secure `500`, because the consumed stream cannot be
-    /// replayed. The request body read is not bounded here: actix's own
-    /// client request timeout owns that seam.
+    /// Set `route_resolution_strict`: a request no registered actix resource
+    /// matches (`HttpRequest::match_pattern` is `None`) is answered `500
+    /// Route resolution failed` (the reference `RouteConfigCheck`; logged
+    /// only under `passive_mode`). The check reads the app's resource map,
+    /// which is attached to the request before any middleware runs, so it
+    /// works for `App::wrap`. A service driven without an app (a bare
+    /// `GuardService` in a unit test) has no resources, so every request is
+    /// unresolved there.
+    #[must_use]
+    pub const fn with_route_resolution_strict(mut self, strict: bool) -> Self {
+        self.parity.route_resolution_strict = strict;
+        self
+    }
+
+    pub(crate) const fn route_resolution_strict(&self) -> bool {
+        self.parity.route_resolution_strict
+    }
+
+    /// Bound the request-body read and the response-body read the
+    /// `return_pattern` body rules need (`body_read_timeout`). A request body
+    /// that does not arrive in full in time answers `408 Request body read
+    /// timed out` and is never forwarded; a response body that does not
+    /// arrive answers the fail-secure `500`, because the consumed stream
+    /// cannot be replayed. [`GuardTransform::from_security_config`] installs
+    /// the config's value; without one the reads are unbounded.
     #[must_use]
     pub fn with_body_read_timeout(mut self, timeout: Duration) -> Self {
         self.body_read_timeout = Some(timeout);
@@ -786,16 +864,20 @@ impl GuardTransform {
     ///
     /// Fields the adapter reads itself: `fail_secure`, `trusted_proxies` and
     /// `trusted_proxy_depth` (the client policy), `exclude_paths`,
-    /// `auth_verifier` (the fallback of a route's verifiers) and
-    /// `body_read_timeout` (the response-body read). `route_resolution_strict`
-    /// is not applied: actix resolves routes after the middleware, so the
-    /// adapter cannot tell an unresolved route apart. The `agent_*`
-    /// transport knobs configure the agent the host injects, see
-    /// [`GuardTransform::from_security_config_with`].
+    /// `auth_verifier` (the fallback of a route's verifiers),
+    /// `body_read_timeout` (the request-body read, answered `408`, and the
+    /// response-body read) and `route_resolution_strict` (a request no actix
+    /// resource matches answers `500 Route resolution failed`). The stages a
+    /// dynamic rule can change are read from the live config per request. With
+    /// the `agent` feature and no agent in the options, the telemetry agent is
+    /// built from the `agent_*` fields (inside a running actix system); a
+    /// failure degrades (see [`GuardTransform::agent_stats`]) unless
+    /// `agent_strict`.
     ///
     /// # Errors
     ///
-    /// [`GuardConfigError`] when an engine constructor rejects a value
+    /// [`GuardConfigError`] when [`SecurityConfig::validate`] rejects the
+    /// config or an engine constructor rejects a value
     /// (an invalid IP/CIDR list entry, a zero rate-limit knob, a
     /// ReDoS-unsafe blocked user-agent pattern, an unknown cloud provider,
     /// country rules without a resolver).
@@ -807,8 +889,8 @@ impl GuardTransform {
 
     /// [`GuardTransform::from_security_config`] with the collaborators the
     /// config cannot carry: the telemetry agent (any [`TelemetryHandler`];
-    /// build one from the `agent_*` fields with guard-agent-rs's
-    /// `GuardAgentTelemetry`) and the Logfire client. The agent feeds the
+    /// an agent given here wins over the one the `agent` feature would build
+    /// from the `agent_*` fields) and the Logfire client. The agent feeds the
     /// event bus, the metrics collector, `agent_stats` and the dynamic
     /// rules.
     ///
@@ -819,9 +901,45 @@ impl GuardTransform {
         config: &guard_core_engine::security_config::SecurityConfig,
         options: &WiringOptions,
     ) -> Result<Self, GuardConfigError> {
+        #[cfg(feature = "agent")]
+        if options.agent.is_none() {
+            // The reference builds the agent from the config
+            // (`config.to_agent_config()`); a failure degrades unless
+            // `agent_strict`.
+            match crate::agent::build(config) {
+                Ok(Some(agent)) => {
+                    let mut options = options.clone();
+                    options.agent = Some(agent);
+                    return Self::wired(config, &options);
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    if let Some(hook) = &config.on_error {
+                        hook("agent_init", &message, &std::collections::BTreeMap::new());
+                    }
+                    if config.agent_strict {
+                        return Err(GuardConfigError::Agent(message));
+                    }
+                    return Ok(Self::wired(config, options)?.with_agent_degraded());
+                }
+            }
+        }
+        Self::wired(config, options)
+    }
+
+    fn wired(
+        config: &guard_core_engine::security_config::SecurityConfig,
+        options: &WiringOptions,
+    ) -> Result<Self, GuardConfigError> {
         Ok(Self::from_wiring(Wiring::from_security_config_with(
             config, options,
         )?))
+    }
+
+    #[cfg(feature = "agent")]
+    fn with_agent_degraded(mut self) -> Self {
+        self.parity.agent_degraded = true;
+        self
     }
 
     /// Install every part of a built [`Wiring`]. The parts are public, so a
@@ -858,9 +976,11 @@ impl GuardTransform {
             events,
             metrics,
             dynamic_rules,
+            live: live_context,
             ..
         } = wiring;
         let mut transform = Self::new(detect)
+            .with_route_resolution_strict(config.route_resolution_strict)
             .with_passive_mode(passive_mode)
             .with_penetration_detection(penetration_detection)
             .with_path_exclusions(exclusions)
@@ -902,7 +1022,32 @@ impl GuardTransform {
                 )
                 .with_distributed_ban_store(distributed.ban_store);
         }
-        transform
+        transform.install_live(&live_context)
+    }
+
+    /// Install the live-config cell: the rate-limit stage and the stages a
+    /// dynamic rule can change are rebuilt from the live config when a rule
+    /// lands (see `guard_core_rs::live`).
+    fn install_live(mut self, context: &LiveContext) -> Self {
+        let snapshot = self.clone();
+        let counters = self
+            .ban_state
+            .as_ref()
+            .map_or_else(ViolationCounters::new, |state| state.counters.clone());
+        let cell = context.cell(move |stages| ActixLive {
+            stages: Arc::clone(stages),
+            rate_stage: snapshot.build_live_stage(stages, &counters),
+        });
+        if let Ok(cell) = cell {
+            self.live = Some(Arc::new(cell));
+        }
+        self
+    }
+
+    /// Point the transform at the live stages for the request in flight (a
+    /// no-op for a transform built without a config).
+    pub(crate) fn refresh_live(&mut self) {
+        self.live_now = self.live.as_ref().map(|cell| cell.get());
     }
 
     /// Replace the body buffering cap, in bytes.
@@ -1406,11 +1551,11 @@ impl GuardTransform {
         self.telemetry.as_ref().map_or(
             AgentStats {
                 enabled: false,
-                degraded: false,
+                degraded: self.parity.agent_degraded,
             },
             |telemetry| AgentStats {
                 enabled: true,
-                degraded: telemetry.degraded(),
+                degraded: self.parity.agent_degraded || telemetry.degraded(),
             },
         )
     }
@@ -1481,8 +1626,11 @@ impl GuardTransform {
         &self.custom_error_responses
     }
 
-    pub(crate) const fn emergency_mode(&self) -> Option<&EmergencyModeStage> {
-        self.emergency_mode.as_ref()
+    pub(crate) fn emergency_mode(&self) -> Option<&EmergencyModeStage> {
+        match &self.live_now {
+            Some(live) => live.stages.emergency.as_ref(),
+            None => self.emergency_mode.as_ref(),
+        }
     }
 
     pub(crate) const fn https_enforcement(&self) -> Option<&HttpsEnforcementStage> {
@@ -1509,22 +1657,34 @@ impl GuardTransform {
         self.time_window_gate.as_ref()
     }
 
-    pub(crate) const fn geo_blocking(&self) -> Option<&GeoStage> {
-        self.geo_blocking.as_ref()
+    pub(crate) fn geo_blocking(&self) -> Option<&GeoStage> {
+        match &self.live_now {
+            Some(live) => live.stages.geo.as_ref(),
+            None => self.geo_blocking.as_ref(),
+        }
     }
 
-    pub(crate) const fn cloud_provider(&self) -> Option<&CloudProviderStage> {
-        self.cloud_provider.as_ref()
+    pub(crate) fn cloud_provider(&self) -> Option<&CloudProviderStage> {
+        match &self.live_now {
+            Some(live) => live.stages.cloud.as_ref(),
+            None => self.cloud_provider.as_ref(),
+        }
     }
 
-    pub(crate) const fn user_agent(&self) -> Option<&UserAgentStage> {
-        self.user_agent.as_ref()
+    pub(crate) fn user_agent(&self) -> Option<&UserAgentStage> {
+        match &self.live_now {
+            Some(live) => live.stages.user_agent.as_ref(),
+            None => self.user_agent.as_ref(),
+        }
     }
 
     /// The installed engine stage (set by `Transform::new_transform`);
     /// every stateful decision and emission goes through it.
     pub(crate) fn stage(&self) -> Option<&RateLimitStage> {
-        self.stage.as_deref()
+        match &self.live_now {
+            Some(live) => Some(&live.rate_stage),
+            None => self.stage.as_deref(),
+        }
     }
 
     /// Build the engine stage from the configured handles and seams.
@@ -1546,17 +1706,45 @@ impl GuardTransform {
             },
             |state| state.config.clone(),
         );
+        self.stage_over(
+            rate_limit,
+            ip_ban,
+            self.rate_limiter.as_deref().cloned(),
+            self.ban_state
+                .as_ref()
+                .map(|state| (state.manager.clone(), state.counters.clone())),
+        )
+    }
+
+    /// The same stage over the live stages: the limiter and the ban knobs a
+    /// dynamic rule changed, sharing the recorded windows and the ban store.
+    fn build_live_stage(&self, live: &LiveStages, counters: &ViolationCounters) -> RateLimitStage {
+        self.stage_over(
+            live.rate_limit.clone(),
+            live.ip_ban.clone(),
+            Some(live.rate_limiter.clone()),
+            Some((live.bans.clone(), counters.clone())),
+        )
+    }
+
+    fn stage_over(
+        &self,
+        rate_limit: RateLimitConfig,
+        ip_ban: IpBanConfig,
+        limiter: Option<RateLimiter>,
+        bans: Option<(IpBanManager, ViolationCounters)>,
+    ) -> RateLimitStage {
         let mut builder = RateLimitStage::builder(RateLimitStageConfig {
             rate_limit,
             ip_ban,
             passive_mode: self.passive_mode,
             custom_error_responses: self.custom_error_responses.clone(),
         });
-        if let Some(limiter) = &self.rate_limiter {
-            builder = builder.limiter(limiter.as_ref().clone());
+        if let Some(limiter) = limiter {
+            builder = builder.limiter(limiter);
         }
-        if let Some(state) = &self.ban_state {
-            builder = builder.ban_manager(state.manager.clone(), state.counters.clone());
+        if let Some((manager, counters)) = bans {
+            builder = builder.ban_manager(manager, counters);
         }
         if let Some(resolver) = &self.route_tiers {
             {
@@ -1863,5 +2051,9 @@ mod tests {
         assert!(matches!(converted[4], GuardConfigError::Cloud(_)));
         assert!(matches!(converted[5], GuardConfigError::Redis(_)));
         assert!(matches!(converted[6], GuardConfigError::Geo(_)));
+        let config = GuardConfigError::from(WiringError::Config(SecurityConfigError {
+            problems: vec!["bad".to_owned()],
+        }));
+        assert!(matches!(config, GuardConfigError::Config(_)));
     }
 }

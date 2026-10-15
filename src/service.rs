@@ -89,6 +89,8 @@ impl<S: std::fmt::Debug> std::fmt::Debug for GuardService<S> {
 enum BufferFailure {
     /// The body exceeded the buffering cap; reading stopped early.
     TooLarge,
+    /// The body did not arrive within `body_read_timeout`.
+    TimedOut,
     /// The body stream errored mid-read. The underlying error is dropped on
     /// purpose: it is body-transport noise (client abort, socket reset), not
     /// a security signal, and it must not leak into the `500` response.
@@ -125,7 +127,8 @@ where
     #[allow(clippy::too_many_lines)] // the reference pipeline order, one arm per check
     fn call(&self, request: ServiceRequest) -> Self::Future {
         let next = Rc::clone(&self.next);
-        let transform = self.transform.clone();
+        let mut transform = self.transform.clone();
+        transform.refresh_live();
         Box::pin(async move {
             let started = std::time::Instant::now();
             let (request, payload) = request.into_parts();
@@ -185,6 +188,18 @@ where
                 });
             let route = route_carrier.as_deref();
 
+            // The reference `RouteConfigCheck` (it also runs on the scoped
+            // pipeline): a request no registered actix resource matches is
+            // refused under `route_resolution_strict`. The app's resource map
+            // rides on the request before any middleware runs, so
+            // `match_pattern` answers here even for `App::wrap`.
+            if transform.route_resolution_strict()
+                && request.match_pattern().is_none()
+                && let Some(response) = unresolved_route_response(&request, &transform, &facts)
+            {
+                return Ok(response);
+            }
+
             // The reference `RouteConfigResolver.should_bypass_check`: the
             // named check, or the `"all"` wildcard.
             let bypassed = |check: &str| {
@@ -226,41 +241,6 @@ where
                     &next, request, payload, &transform, &mut facts, route, started,
                 )
                 .await;
-            }
-
-            // The reference `process_usage_rules`: the route's usage and
-            // frequency behavior rules track the request observation and a
-            // crossed threshold dispatches the rule's action (a `ban`
-            // lands in the shared ban manager and renders the banned
-            // shape). The behavioral processor runs before the check
-            // pipeline (the reference dispatches it from the middleware's
-            // request pass).
-            let route_rules: &[guard_core_engine::behavior::BehaviorRule] =
-                route.map_or(&[], |route| &route.behavior_rules);
-            if !route_rules.is_empty()
-                && let Some(processor) = transform.response_processor.as_ref()
-            {
-                let endpoint_id = format!("{}:{}", facts.method, facts.path);
-                let actions = processor.process_usage_rules(
-                    &endpoint_id,
-                    &facts.ip_string,
-                    route_rules,
-                    std::time::SystemTime::now(),
-                );
-                if actions
-                    .iter()
-                    .any(guard_core_engine::behavior::BehaviorAction::is_ban)
-                {
-                    return Ok(finish_generated(
-                        &request,
-                        &transform,
-                        response::blocked_with_body(
-                            request.clone(),
-                            403,
-                            crate::ACTIVITY_BANNED_MESSAGE,
-                        ),
-                    ));
-                }
             }
 
             // The reference `_check_route_ip_access` (inside the
@@ -449,13 +429,21 @@ where
                 .and_then(|route| route.max_request_size)
                 .and_then(|size| usize::try_from(size).ok())
                 .unwrap_or_else(|| transform.body_cap());
-            let buffered = match buffer_body(payload, body_cap).await {
+            let buffered = match buffer_body_bounded(payload, body_cap, &transform).await {
                 Ok(buffered) => buffered,
                 Err(BufferFailure::TooLarge) => {
                     return Ok(finish_generated(
                         &request,
                         &transform,
                         response::oversize(request.clone()),
+                    ));
+                }
+                Err(BufferFailure::TimedOut) => {
+                    return Ok(block_response(
+                        &request,
+                        &transform,
+                        guard_core_engine::request_limits::BODY_READ_TIMEOUT_STATUS,
+                        guard_core_engine::request_limits::BODY_READ_TIMEOUT_MESSAGE,
                     ));
                 }
                 Err(BufferFailure::Read) => {
@@ -957,6 +945,42 @@ where
                 return Ok(block_response(&request, &transform, status, ""));
             }
 
+            // The reference `process_usage_rules`: after the whole pipeline
+            // passed (`dispatch` runs `behavioral_processor.process_usage_rules`
+            // between `_handle_pipeline_block` and `call_next`), the route's
+            // usage and frequency behavior rules track the request
+            // observation and a crossed threshold dispatches the rule's action
+            // (a `ban` lands in the shared ban manager and renders the banned
+            // shape). A request the pipeline blocked never reaches it, and
+            // neither does an unattributed one (`and client_ip`).
+            if let Some(route) = route
+                && !route.behavior_rules.is_empty()
+                && let Some(ip) = facts.ip
+                && let Some(processor) = transform.response_processor.as_ref()
+            {
+                let endpoint_id = format!("{}:{}", facts.method, facts.path);
+                let actions = processor.process_usage_rules(
+                    &endpoint_id,
+                    &ip.to_string(),
+                    &route.behavior_rules,
+                    std::time::SystemTime::now(),
+                );
+                if actions
+                    .iter()
+                    .any(guard_core_engine::behavior::BehaviorAction::is_ban)
+                {
+                    return Ok(finish_generated(
+                        &request,
+                        &transform,
+                        response::blocked_with_body(
+                            request.clone(),
+                            403,
+                            crate::ACTIVITY_BANNED_MESSAGE,
+                        ),
+                    ));
+                }
+            }
+
             // actix Web consumes the payload while buffering, so the
             // request the next service sees is rebuilt around the
             // buffered bytes (see the crate docs on request rebuilding).
@@ -1236,6 +1260,71 @@ fn unresolved_client_response(
         guard_core_engine::ip_extraction::UNRESOLVABLE_CLIENT_ADDRESS_STATUS,
         guard_core_engine::ip_extraction::UNRESOLVABLE_CLIENT_ADDRESS_MESSAGE,
     )
+}
+
+/// The reference `RouteConfigCheck._handle_unresolved_route`: the
+/// `route_unresolved` event, the `on_block` hook, and the `500 Route
+/// resolution failed` answer unless `passive_mode` (log only). `None` when
+/// the request continues.
+fn unresolved_route_response(
+    request: &HttpRequest,
+    transform: &GuardTransform,
+    facts: &RequestFacts,
+) -> Option<ServiceResponse> {
+    use guard_core_engine::route_config::{
+        UNRESOLVED_ROUTE_CHECK_NAME, UNRESOLVED_ROUTE_MESSAGE, UNRESOLVED_ROUTE_REASON,
+        UNRESOLVED_ROUTE_STATUS,
+    };
+    let sensitive = transform
+        .observability()
+        .map(|observability| observability.sensitive.clone())
+        .unwrap_or_default();
+    if let Some(bus) = &transform.events {
+        let mut event = guard_core_rs::events::SecurityEvent::new(
+            guard_core_rs::event_types::EVENT_ROUTE_UNRESOLVED,
+            &facts.ip_string,
+            if transform.passive_mode {
+                "logged_only"
+            } else {
+                "request_blocked"
+            },
+            UNRESOLVED_ROUTE_REASON,
+            guard_core_rs::events::MIDDLEWARE_HANDLER_NAME,
+        );
+        event.endpoint = Some(guard_core_rs::redact::redact_url_for_display(
+            &facts.path,
+            &sensitive,
+        ));
+        event.method = Some(facts.method.clone());
+        bus.send_event(&event);
+    }
+    let observation = request_observation(request);
+    let payload = build_block_payload(
+        UNRESOLVED_ROUTE_CHECK_NAME,
+        UNRESOLVED_ROUTE_REASON,
+        "",
+        transform.passive_mode,
+        &facts.ip_string,
+        observation.url.as_deref().unwrap_or("/"),
+        observation.method.as_deref().unwrap_or(""),
+        Some(UNRESOLVED_ROUTE_STATUS),
+        &sensitive,
+    );
+    fire_block_hook(transform.on_block(), &payload);
+    if transform.passive_mode {
+        return None;
+    }
+    let body = resolve_error_body(
+        transform.custom_error_responses(),
+        UNRESOLVED_ROUTE_STATUS,
+        UNRESOLVED_ROUTE_MESSAGE,
+    );
+    Some(block_response(
+        request,
+        transform,
+        UNRESOLVED_ROUTE_STATUS,
+        &body,
+    ))
 }
 
 /// The `security_bypass` event of an all-checks-bypass route (the reference
@@ -1688,6 +1777,22 @@ async fn buffer_body(mut payload: Payload, cap: usize) -> Result<Option<Bytes>, 
     } else {
         Some(buffered.freeze())
     })
+}
+
+/// [`buffer_body`] raced against the transform's `body_read_timeout` (the
+/// reference `body_read_timeout`); unbounded without one. On expiry the
+/// partial read is dropped: an unread body is never forwarded.
+async fn buffer_body_bounded(
+    payload: Payload,
+    cap: usize,
+    transform: &GuardTransform,
+) -> Result<Option<Bytes>, BufferFailure> {
+    match transform.body_read_timeout {
+        Some(limit) => actix_web::rt::time::timeout(limit, buffer_body(payload, cap))
+            .await
+            .unwrap_or(Err(BufferFailure::TimedOut)),
+        None => buffer_body(payload, cap).await,
+    }
 }
 
 /// Run the engine over every request view, recovering from engine panics.
@@ -4465,8 +4570,15 @@ mod tests {
             whitelist: Some(vec![String::from("not-an-ip")]),
             ..SecurityConfig::default()
         };
+        // The validator names the bad list first.
         let error = GuardTransform::from_security_config(&config).unwrap_err();
-        assert!(matches!(error, GuardConfigError::IpGate(_)));
+        assert!(matches!(error, GuardConfigError::Config(_)));
+        // The stage constructor stays the second line of defence for an
+        // unvalidated config.
+        let error = crate::Wiring::build_unvalidated(&config, &crate::WiringOptions::default())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(error, crate::WiringError::IpGate(_)));
     }
 
     #[actix_web::test]
@@ -4628,7 +4740,10 @@ mod tests {
             detection_max_scan_seconds: 0.0,
             ..SecurityConfig::default()
         };
-        let transform = GuardTransform::from_security_config(&spent).expect("valid");
+        // (Below the validated range, so the unvalidated wiring seam builds it.)
+        let wiring = crate::Wiring::build_unvalidated(&spent, &crate::WiringOptions::default())
+            .expect("wired");
+        let transform = GuardTransform::from_wiring(wiring);
         let (status, _) = status_body(transform, config_request("203.0.113.9", "/hello")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -5530,5 +5645,402 @@ mod tests {
             .to_srv_request();
         let (plain, _, _) = full_status(transform, request).await;
         assert_eq!(plain, StatusCode::OK);
+    }
+
+    // --- reference parity: usage rules order, live rules, strict routes,
+    // body timeout, config validation ---
+
+    fn usage_route() -> RouteConfig {
+        RouteConfig {
+            behavior_rules: vec![guard_core_engine::behavior::BehaviorRule {
+                rule_type: String::from("usage"),
+                threshold: 2,
+                window: 60,
+                pattern: String::new(),
+                action: String::from("ban"),
+                ban_duration: Some(3600),
+                correlate_with_detection: false,
+            }],
+            ..RouteConfig::default()
+        }
+    }
+
+    fn usage_transform() -> GuardTransform {
+        GuardTransform::new(default_config())
+            .with_response_processor(guard_core_rs::process_response::ResponseProcessor::new(
+                None,
+                None,
+                Vec::new(),
+                Arc::new(Mutex::new(
+                    guard_core_engine::behavior::BehaviorTracker::new(),
+                )),
+                IpBanManager::new(),
+                true,
+                262_144,
+                false,
+            ))
+            .with_route_configs(resolver_for(&[("GET", "/api")], usage_route()))
+    }
+
+    #[actix_web::test]
+    async fn usage_rules_run_after_the_pipeline_so_a_blocked_request_is_not_counted() {
+        let guard = guarded(usage_transform()).await;
+        // Three attack requests the pipeline blocks: the reference never
+        // reaches `process_usage_rules` for them.
+        for _ in 0..3 {
+            let response = guard
+                .call(attributed("/api?f=../../etc/passwd", "192.0.2.81"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        // The first request that passes the pipeline is the first observation
+        // (threshold 2): it forwards instead of drawing the ban.
+        let response = guard
+            .call(attributed("/api", "192.0.2.81"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn usage_rules_skip_an_unattributed_request() {
+        let guard = guarded(usage_transform()).await;
+        for _ in 0..4 {
+            let response = guard
+                .call(TestRequest::get().uri("/api").to_srv_request())
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    fn live_transform(
+        change: impl FnOnce(&mut SecurityConfig),
+    ) -> (GuardTransform, Arc<std::sync::RwLock<SecurityConfig>>) {
+        let mut config = SecurityConfig {
+            enable_redis: false,
+            ..SecurityConfig::default()
+        };
+        config.geo_ip_handler = Some(Arc::new(StaticGeo));
+        change(&mut config);
+        let wiring = crate::Wiring::from_security_config(&config).expect("wired");
+        let live = Arc::clone(&wiring.live_config);
+        (GuardTransform::from_wiring(wiring), live)
+    }
+
+    fn rule(
+        live: &Arc<std::sync::RwLock<SecurityConfig>>,
+        change: impl FnOnce(&mut SecurityConfig),
+    ) {
+        change(&mut live.write().expect("live config"));
+    }
+
+    async fn status_of(guard: &GuardService<OkService>, request: ServiceRequest) -> StatusCode {
+        guard.call(request).await.expect("response").status()
+    }
+
+    #[actix_web::test]
+    async fn a_dynamic_rate_limit_rule_changes_the_live_limit_and_keeps_the_windows() {
+        let (transform, live) = live_transform(|config| {
+            config.enable_rate_limiting = true;
+            config.rate_limit = 2;
+            config.rate_limit_window = 60;
+        });
+        let guard = guarded(transform).await;
+        for _ in 0..2 {
+            assert_eq!(
+                status_of(&guard, benign_request("192.0.2.91")).await,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            status_of(&guard, benign_request("192.0.2.91")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        // A rule raises the limit: the recorded window carries over, so the
+        // next request fits under the new ceiling.
+        rule(&live, |config| config.rate_limit = 100);
+        assert_eq!(
+            status_of(&guard, benign_request("192.0.2.91")).await,
+            StatusCode::OK
+        );
+
+        // A rule that switches the limiter off stops the 429s.
+        rule(&live, |config| {
+            config.rate_limit = 1;
+            config.enable_rate_limiting = false;
+        });
+        assert_eq!(
+            status_of(&guard, benign_request("192.0.2.91")).await,
+            StatusCode::OK
+        );
+    }
+
+    #[actix_web::test]
+    async fn dynamic_country_agent_emergency_and_detection_rules_take_effect() {
+        let (transform, live) = live_transform(|_| {});
+        let guard = guarded(transform).await;
+        assert_eq!(
+            status_of(&guard, benign_request("192.0.2.92")).await,
+            StatusCode::OK
+        );
+
+        // A country blocklist (the handler resolves every address to DE).
+        rule(&live, |config| {
+            config.blocked_countries = std::collections::BTreeSet::from(["DE".to_owned()]);
+        });
+        assert_eq!(
+            status_of(&guard, benign_request("192.0.2.92")).await,
+            StatusCode::FORBIDDEN
+        );
+        rule(&live, |config| config.blocked_countries.clear());
+
+        // A blocked user agent.
+        rule(&live, |config| {
+            config.blocked_user_agents = vec!["badbot".to_owned()];
+        });
+        let request = TestRequest::get()
+            .uri("/a")
+            .insert_header(("user-agent", "badbot/1.0"))
+            .peer_addr("192.0.2.92:45000".parse().expect("addr"))
+            .to_srv_request();
+        assert_eq!(status_of(&guard, request).await, StatusCode::FORBIDDEN);
+        rule(&live, |config| config.blocked_user_agents.clear());
+
+        // Emergency mode locks everyone out.
+        rule(&live, |config| config.emergency_mode = true);
+        assert_eq!(
+            status_of(&guard, benign_request("192.0.2.92")).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        rule(&live, |config| config.emergency_mode = false);
+
+        // The detection toggle: the attack passes once scanning is off.
+        assert_eq!(
+            status_of(&guard, attack_request("192.0.2.92")).await,
+            StatusCode::BAD_REQUEST
+        );
+        rule(&live, |config| config.enable_penetration_detection = false);
+        assert_eq!(
+            status_of(&guard, attack_request("192.0.2.92")).await,
+            StatusCode::OK
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_dynamic_cloud_provider_rule_builds_the_stage() {
+        let (transform, live) = live_transform(|_| {});
+        let guard = guarded(transform).await;
+        rule(&live, |config| {
+            config.block_cloud_providers =
+                Some(std::collections::BTreeSet::from(["AWS".to_owned()]));
+        });
+        // The range table is empty until a refresh fills it, so nothing
+        // blocks, but the request still runs through the rebuilt stage.
+        assert_eq!(
+            status_of(&guard, benign_request("192.0.2.93")).await,
+            StatusCode::OK
+        );
+    }
+
+    fn strict_transform() -> GuardTransform {
+        GuardTransform::new(default_config()).with_route_resolution_strict(true)
+    }
+
+    #[actix_web::test]
+    async fn strict_route_resolution_answers_a_request_no_resource_matches() {
+        let app =
+            actix_web::test::init_service(actix_web::App::new().wrap(strict_transform()).route(
+                "/here",
+                actix_web::web::get().to(|| async { HttpResponse::Ok().body("ok") }),
+            ))
+            .await;
+        let nowhere = TestRequest::get()
+            .uri("/nowhere")
+            .peer_addr("192.0.2.61:45000".parse().expect("addr"))
+            .to_request();
+        let response = actix_web::test::call_service(&app, nowhere).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            actix_web::test::read_body(response).await,
+            "Route resolution failed"
+        );
+        // A resolved request passes.
+        let here = TestRequest::get()
+            .uri("/here")
+            .peer_addr("192.0.2.61:45000".parse().expect("addr"))
+            .to_request();
+        let response = actix_web::test::call_service(&app, here).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Without strict mode the unresolved request reaches the router (404).
+        let lax = actix_web::test::init_service(
+            actix_web::App::new()
+                .wrap(GuardTransform::new(default_config()))
+                .route("/here", actix_web::web::get().to(HttpResponse::Ok)),
+        )
+        .await;
+        let nowhere = TestRequest::get()
+            .uri("/nowhere")
+            .peer_addr("192.0.2.61:45000".parse().expect("addr"))
+            .to_request();
+        let response = actix_web::test::call_service(&lax, nowhere).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn the_config_installs_route_resolution_strict() {
+        let mut config = SecurityConfig {
+            enable_redis: false,
+            ..SecurityConfig::default()
+        };
+        config.route_resolution_strict = true;
+        let transform = GuardTransform::from_security_config(&config).expect("transform");
+        let guard = guarded(transform).await;
+        let response = guard
+            .call(benign_request("192.0.2.65"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[actix_web::test]
+    async fn strict_route_resolution_is_log_only_under_passive_mode_and_emits_the_event() {
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let (blocks, hook) = block_collector();
+        let passive = strict_transform()
+            .with_passive_mode(true)
+            .with_event_bus(recording_bus(Arc::clone(&events)))
+            .with_on_block(hook);
+        let guard = guarded(passive).await;
+        assert_eq!(
+            status_of(&guard, benign_request("192.0.2.62")).await,
+            StatusCode::OK
+        );
+        let seen: Vec<String> = events
+            .lock()
+            .expect("events")
+            .iter()
+            .map(|event| format!("{}:{}", event.event_type, event.action_taken))
+            .collect();
+        assert_eq!(seen, ["route_unresolved:logged_only"]);
+        assert_eq!(blocks.lock().expect("blocks").len(), 1);
+    }
+
+    #[actix_web::test]
+    async fn strict_route_resolution_fires_on_block_and_the_event_when_enforced() {
+        let events: Arc<Mutex<Vec<guard_core_rs::events::SecurityEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let (blocks, hook) = block_collector();
+        let guard = guarded(
+            strict_transform()
+                .with_event_bus(recording_bus(Arc::clone(&events)))
+                .with_on_block(hook),
+        )
+        .await;
+        assert_eq!(
+            status_of(&guard, benign_request("192.0.2.66")).await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            events.lock().expect("events")[0].action_taken,
+            "request_blocked"
+        );
+        assert_eq!(blocks.lock().expect("blocks").len(), 1);
+    }
+
+    /// A request body that delivers `first` and then never again (a stalled
+    /// upload).
+    struct StalledStream {
+        first: Option<Bytes>,
+    }
+
+    impl Stream for StalledStream {
+        type Item = Result<Bytes, PayloadError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.first.take() {
+                Some(chunk) => Poll::Ready(Some(Ok(chunk))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    fn stalled_request(first: &'static [u8]) -> ServiceRequest {
+        let mut request = TestRequest::post()
+            .uri("/upload")
+            .peer_addr("192.0.2.63:45000".parse().expect("addr"))
+            .to_srv_request();
+        request.set_payload(Payload::Stream {
+            payload: Box::pin(StalledStream {
+                first: Some(Bytes::from_static(first)),
+            }),
+        });
+        request
+    }
+
+    #[actix_web::test]
+    async fn a_stalled_body_is_answered_408_and_never_forwarded() {
+        let guard = guarded(
+            GuardTransform::new(default_config())
+                .with_body_read_timeout(std::time::Duration::from_millis(50)),
+        )
+        .await;
+        let response = actix_web::rt::time::timeout(
+            std::time::Duration::from_secs(5),
+            guard.call(stalled_request(b"partial")),
+        )
+        .await
+        .expect("the guard must answer, not wait for the stalled body")
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(body_text(response), "Request body read timed out");
+    }
+
+    #[actix_web::test]
+    async fn a_body_that_arrives_in_time_is_forwarded_whole() {
+        let guard = guarded(
+            GuardTransform::new(default_config())
+                .with_body_read_timeout(std::time::Duration::from_secs(3)),
+        )
+        .await;
+        let request = TestRequest::post()
+            .uri("/upload")
+            .peer_addr("192.0.2.64:45000".parse().expect("addr"))
+            .set_payload("hello")
+            .to_srv_request();
+        assert_eq!(status_of(&guard, request).await, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn the_config_supplies_the_request_body_timeout() {
+        let mut config = SecurityConfig {
+            enable_redis: false,
+            ..SecurityConfig::default()
+        };
+        config.body_read_timeout = 0.05;
+        let guard =
+            guarded(GuardTransform::from_security_config(&config).expect("transform")).await;
+        let response = guard.call(stalled_request(b"x")).await.expect("response");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn the_config_is_validated_at_construction() {
+        let mut config = SecurityConfig {
+            enable_redis: false,
+            ..SecurityConfig::default()
+        };
+        config.auto_ban_threshold = 0;
+        let error = GuardTransform::from_security_config(&config).expect_err("rejected");
+        assert!(matches!(error, GuardConfigError::Config(_)));
+        assert!(error.to_string().contains("auto_ban_threshold"), "{error}");
+        assert!(std::error::Error::source(&error).is_some());
+        let agent = GuardConfigError::Agent("no runtime".to_owned());
+        assert_eq!(agent.to_string(), "agent: no runtime");
+        assert!(std::error::Error::source(&agent).is_none());
     }
 }

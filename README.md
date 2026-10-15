@@ -267,7 +267,7 @@ The actix peer address is the connecting peer. The identity every stage runs und
 
 `GuardTransform::from_security_config(&config)` builds everything through the facade's `Wiring`, the one `SecurityConfig` mapping the Rust adapters share (the field-by-field table is in the `guard_core_rs::wiring` module docs). Geo country rules, cloud providers (with the per-request range refresh), `endpoint_rate_limits`, the rate-limit auto-ban, `custom_request_check`, `auth_verifier` (the fallback of a route's verifiers), `custom_response_modifier`, `on_error`, `cors_expose_headers`, `trusted_proxies` and the rest all land on the transform. The transform clones per actix worker and every clone shares the one set of rate-limit, ban and cloud stores.
 
-The telemetry agent is injected: build a `TelemetryHandler` from the `agent_*` fields with guard-agent-rs's `GuardAgentTelemetry` and call `GuardTransform::from_security_config_with(&config, &WiringOptions { agent: Some(agent), logfire_client: None })`. The agent feeds the event bus, the metrics collector, `agent_stats()` and the dynamic rules. Wiring starts nothing: call `transform.telemetry()` and its `start()` / `stop()`, and `transform.spawn_dynamic_rules()` starts the poll loop (drop the handle to stop it). Body `return_pattern` rules buffer the forwarded response body (bounded in time by `body_read_timeout`, a read error or timeout answers `500`) and re-emit it intact, so do not combine them with endless streaming responses.
+The `agent` Cargo feature builds the telemetry agent from the `agent_*` fields inside `from_security_config` (call it from a running actix system): a failure degrades, reported by `agent_stats()`, unless `agent_strict` is set, which answers `GuardConfigError::Agent`. You can also inject your own `TelemetryHandler` with `GuardTransform::from_security_config_with(&config, &WiringOptions { agent: Some(agent), logfire_client: None })`, which wins over the built one. The config is validated first (`GuardConfigError::Config`). The stages a dynamic rule can change (country, cloud, user agent, emergency mode, the detection toggle, the rate-limit and ban knobs) are read from the live config on every request, so a rule takes effect without rebuilding the transform; a transform built through the builders keeps its static stages. `route_resolution_strict` answers `500 Route resolution failed` for a request no registered actix resource matches (read from the app's resource map, so it works for `App::wrap`; a log-only event under `passive_mode`). `body_read_timeout` bounds the request-body read, answered `408 Request body read timed out` and never forwarded. Route usage and frequency rules run after the whole pipeline passed, so a blocked or unattributed request is not counted. The agent feeds the event bus, the metrics collector, `agent_stats()` and the dynamic rules. Wiring starts nothing: call `transform.telemetry()` and its `start()` / `stop()`, and `transform.spawn_dynamic_rules()` starts the poll loop (drop the handle to stop it). Body `return_pattern` rules buffer the forwarded response body (bounded in time by `body_read_timeout`, a read error or timeout answers `500`) and re-emit it intact, so do not combine them with endless streaming responses.
 
 ## Body cap
 
@@ -305,9 +305,7 @@ Every reference check the engine ships is installable on `GuardTransform`, and `
 ## Not wired on purpose
 
 - **WebSocket frames**: the guard screens the upgrade handshake (the `WebSocketGuard` transform above); frames after the upgrade are not intercepted, there is no per-frame surface.
-- **`route_resolution_strict`**: actix resolves routes after the middleware runs, so the adapter cannot tell an unresolved route apart. The knob stays on the config.
-- **Request-body read timeout**: actix's own client request timeout owns that seam; `body_read_timeout` bounds the response-body read the return rules need.
-- **The `redis` backend**: the adapter does not enable `guard-core-rs`'s `redis` feature. Enable it in your own `Cargo.toml` and `enable_redis` plus `redis_url` wire the shared stores; otherwise limits and bans stay per process.
+- **Distributed stores without the feature**: the `redis` Cargo feature forwards `guard-core-rs/redis`. Without it `enable_redis` plus `redis_url` cannot build the shared stores, so limits and bans stay per process.
 
 ## Development
 
@@ -317,6 +315,7 @@ Every reference check the engine ships is installable on `GuardTransform`, and `
 ```bash
 cargo check --all-targets
 cargo test
+cargo test --features agent
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
