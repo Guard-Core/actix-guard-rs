@@ -1430,7 +1430,7 @@ async fn finish_forwarded(
                 prefix = Some(bytes.slice(..bytes.len().min(max)));
                 forwarded = response;
             }
-            Err(failed) => return failed,
+            Err(failed) => return *failed,
         }
     }
     run_response_processor(
@@ -1451,7 +1451,7 @@ async fn finish_forwarded(
 async fn buffer_response_body(
     forwarded: ServiceResponse,
     transform: &GuardTransform,
-) -> Result<(ServiceResponse, Bytes), ServiceResponse> {
+) -> Result<(ServiceResponse, Bytes), Box<ServiceResponse>> {
     let (request, response) = forwarded.into_parts();
     let (head, body) = response.into_parts();
     let read = actix_web::body::to_bytes(body);
@@ -1463,11 +1463,11 @@ async fn buffer_response_body(
         None => read.await.ok(),
     };
     let Some(bytes) = bytes else {
-        return Err(finish_generated(
+        return Err(Box::new(finish_generated(
             &request,
             transform,
             response::failure(request.clone()),
-        ));
+        )));
     };
     let rebuilt = head.set_body(actix_web::body::BoxBody::new(bytes.clone()));
     Ok((ServiceResponse::new(request, rebuilt), bytes))
