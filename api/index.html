@@ -974,9 +974,11 @@ closed on an invalid entry (<code>IpGateError</code> names the list and the entr
 <p>Evaluation order mirrors the reference engine: with a non-empty <code>whitelist</code>,
 an IP matching neither the whitelist nor <code>exempt_ips</code> is denied; otherwise a
 <code>blacklist</code> hit is denied. Both denials answer <code>403 Forbidden</code> with
-<code>Forbidden</code> before body buffering. The client IP is the request's peer
-address; a request without one is not attributed, the gate does not run, and
-detection still screens it. A passed request gets an
+<code>Forbidden</code> before body buffering. The client IP is the resolved client (the
+peer address, or the forwarded client behind a trusted proxy, see
+<code>GuardTransform::with_client_policy</code>); a request without one is not
+attributed, the gate does not run, and detection still screens it (a config
+built with <code>from_security_config</code> rejects it under <code>fail_secure</code>). A passed request gets an
 <code>IpGateDecision { is_whitelisted, is_exempt }</code> inserted into its request
 extensions so downstream handlers can read the skip state.</p>
 <p><strong>exempt_ips vs whitelist.</strong> <code>exempt_ips</code> is noise reduction for
