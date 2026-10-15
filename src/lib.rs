@@ -237,6 +237,7 @@ pub use guard_core_rs::headers_auth::{
 pub use guard_core_rs::https_enforcement::{
     HttpsEnforcementStage, HttpsRedirectAnswer as HttpsRedirect,
 };
+pub use guard_core_rs::metrics::MetricsCollector;
 pub use guard_core_rs::process_response::ResponseProcessor;
 pub use guard_core_rs::request_logging::{RequestLoggingStage, RequestLoggingStageConfig};
 pub use guard_core_rs::responses::{BlockPayload, CustomErrorResponses, OnBlockHook};
@@ -458,6 +459,10 @@ pub struct GuardTransform {
     /// The response-side pass (behavioral return rules + security headers
     /// + CORS) applied to every response the guard touches.
     response_processor: Option<Arc<ResponseProcessor>>,
+    /// The reference `MetricsCollector` the forwarded-response path feeds
+    /// (`collect_request_metrics`: request count, response time, error
+    /// rate); `None` emits nothing.
+    metrics: Option<MetricsCollector>,
     /// The reference `enable_penetration_detection`: the global scan
     /// toggle (the reference default `true`).
     penetration_detection_enabled: bool,
@@ -514,6 +519,7 @@ impl GuardTransform {
             cloud_provider: None,
             user_agent: None,
             response_processor: None,
+            metrics: None,
             exclude_paths: Vec::new(),
             penetration_detection_enabled: true,
             scan_fn: guard_core_engine::detection_exclusions::scan_request,
@@ -657,6 +663,9 @@ impl GuardTransform {
             transform = transform.with_on_block(hook);
         }
 
+        // The spread below keeps the literal compiling when the engine adds a
+        // field; clippy calls it needless while the field list is complete.
+        #[allow(clippy::needless_update)]
         if !config.excluded_detection_headers.is_empty()
             || !config.excluded_detection_params.is_empty()
             || !config.excluded_detection_body_fields.is_empty()
@@ -687,6 +696,7 @@ impl GuardTransform {
                             .collect()
                     }),
                 detection_scan_body: Some(config.detection_scan_body),
+                ..DetectionExclusionConfig::default()
             });
         }
 
@@ -1304,6 +1314,21 @@ impl GuardTransform {
     #[must_use]
     pub fn with_response_processor(mut self, processor: ResponseProcessor) -> Self {
         self.response_processor = Some(Arc::new(processor));
+        self
+    }
+
+    /// Install the reference `MetricsCollector` (the `agent_enable_metrics`
+    /// emission point): every response the next service produces for a
+    /// request the guard let through emits the reference
+    /// `collect_request_metrics` samples - `request_count`, `response_time`
+    /// (seconds from the request reaching the guard until the next service
+    /// returns the response head, like the reference stopping at response
+    /// start) and, for a `>= 400` status, `error_rate`. Guard block answers
+    /// and `exclude_paths` bypasses emit nothing. The collector owns the
+    /// `agent_enable_metrics` gate and the transport.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsCollector) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 

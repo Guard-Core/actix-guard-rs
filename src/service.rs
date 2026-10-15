@@ -126,6 +126,7 @@ where
         let next = Rc::clone(&self.next);
         let transform = self.transform.clone();
         Box::pin(async move {
+            let started = std::time::Instant::now();
             let (request, payload) = request.into_parts();
             let facts = request_facts(&request);
 
@@ -920,6 +921,16 @@ where
                 .call(rebuilt)
                 .await
                 .map(ServiceResponse::map_into_boxed_body)?;
+            // The request metrics land as soon as the response head is back
+            // (the response time stops at response start).
+            if let Some(metrics) = transform.metrics.as_ref() {
+                metrics.collect_request_metrics(
+                    &facts.path,
+                    &facts.method,
+                    Some(started.elapsed().as_secs_f64()),
+                    forwarded.status().as_u16(),
+                );
+            }
             run_response_processor(
                 &transform,
                 &facts,
@@ -2191,6 +2202,132 @@ mod tests {
 
     fn attack_request(ip: &str) -> ServiceRequest {
         attributed("/files/../../etc/passwd", ip)
+    }
+
+    // --- per-request metrics (the reference `collect_request_metrics`) ---
+
+    type SeenMetrics = Arc<Mutex<Vec<guard_core_rs::metrics::SecurityMetric>>>;
+
+    fn recording_metrics(enabled: bool) -> (guard_core_rs::metrics::MetricsCollector, SeenMetrics) {
+        let seen: SeenMetrics = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let collector = guard_core_rs::metrics::MetricsCollector::new(enabled).with_handler(
+            Arc::new(move |metric: &guard_core_rs::metrics::SecurityMetric| {
+                sink.lock().expect("sink").push(metric.clone());
+            }),
+        );
+        (collector, seen)
+    }
+
+    fn metric_summary(seen: &SeenMetrics) -> Vec<(String, Option<String>)> {
+        let mut rows: Vec<(String, Option<String>)> = seen
+            .lock()
+            .expect("sink")
+            .iter()
+            .map(|metric| {
+                (
+                    metric.metric_type.clone(),
+                    metric.tags.get("status").cloned(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A next service that answers a fixed status.
+    struct StatusService(StatusCode);
+
+    impl Service<ServiceRequest> for StatusService {
+        type Response = ServiceResponse;
+        type Error = Error;
+        type Future = std::future::Ready<Result<ServiceResponse, Error>>;
+
+        fn poll_ready(&self, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&self, request: ServiceRequest) -> Self::Future {
+            std::future::ready(Ok(
+                request.into_response(HttpResponse::build(self.0).finish())
+            ))
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_forwarded_request_emits_count_and_response_time() {
+        let (collector, seen) = recording_metrics(true);
+        let transform = GuardTransform::new(default_config()).with_metrics(collector);
+        let (status, _, _) = full_status(transform, benign_request("203.0.113.9")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            metric_summary(&seen),
+            vec![
+                ("request_count".to_owned(), None),
+                ("response_time".to_owned(), Some("200".to_owned())),
+            ]
+        );
+        let seen = seen.lock().expect("sink");
+        let time = seen
+            .iter()
+            .find(|metric| metric.metric_type == "response_time")
+            .expect("response_time");
+        assert!(time.value >= 0.0);
+        assert_eq!(
+            time.tags.get("endpoint").map(String::as_str),
+            Some("/hello")
+        );
+        assert_eq!(time.tags.get("method").map(String::as_str), Some("GET"));
+    }
+
+    #[actix_web::test]
+    async fn a_5xx_forwarded_response_also_emits_error_rate() {
+        let (collector, seen) = recording_metrics(true);
+        let guard = GuardTransform::new(default_config())
+            .with_metrics(collector)
+            .new_transform(StatusService(StatusCode::SERVICE_UNAVAILABLE))
+            .await
+            .expect("infallible");
+        std::future::poll_fn(|cx| guard.poll_ready(cx))
+            .await
+            .expect("ready");
+        let response = guard
+            .call(benign_request("203.0.113.9"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            metric_summary(&seen),
+            vec![
+                ("error_rate".to_owned(), Some("503".to_owned())),
+                ("request_count".to_owned(), None),
+                ("response_time".to_owned(), Some("503".to_owned())),
+            ]
+        );
+    }
+
+    #[actix_web::test]
+    async fn no_metrics_without_a_collector_or_when_disabled_or_blocked() {
+        // No collector installed: nothing to emit, the request still passes.
+        let (status, _, _) = full_status(
+            GuardTransform::new(default_config()),
+            benign_request("203.0.113.9"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // `agent_enable_metrics = false` gates inside the collector.
+        let (collector, seen) = recording_metrics(false);
+        let transform = GuardTransform::new(default_config()).with_metrics(collector);
+        full_status(transform, benign_request("203.0.113.9")).await;
+        assert!(seen.lock().expect("sink").is_empty());
+
+        // A guard block is not a pass-through response.
+        let (collector, seen) = recording_metrics(true);
+        let transform = GuardTransform::new(default_config()).with_metrics(collector);
+        let (status, _, _) = full_status(transform, attack_request("203.0.113.9")).await;
+        assert_ne!(status, StatusCode::OK);
+        assert!(seen.lock().expect("sink").is_empty());
     }
 
     #[actix_web::test]
