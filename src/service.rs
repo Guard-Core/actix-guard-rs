@@ -17,6 +17,7 @@ use guard_core_engine::route_config::RouteConfig;
 use guard_core_rs::process_response::{RequestBits, ResponseBits};
 use guard_core_rs::responses::{build_block_payload, fire_block_hook, resolve_error_body};
 use guard_core_rs::tower::{RequestObservation, RouteRateLimits};
+use guard_core_rs::wiring::ClientPolicy;
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -128,25 +129,8 @@ where
         Box::pin(async move {
             let started = std::time::Instant::now();
             let (request, payload) = request.into_parts();
-            let facts = request_facts(&request);
-
-            // The reference `exclude_paths` carve-out runs first: the
-            // docs/static paths bypass the whole pipeline (exact path
-            // match), detection included.
-            if transform.exclude_paths.contains(&facts.path) {
-                let rebuilt = ServiceRequest::from_parts(request, payload);
-                let mut forwarded = next
-                    .call(rebuilt)
-                    .await
-                    .map(ServiceResponse::map_into_boxed_body)?;
-                run_response_processor(
-                    &transform,
-                    &facts,
-                    forwarded.status().as_u16(),
-                    forwarded.response_mut(),
-                );
-                return Ok(forwarded);
-            }
+            let mut facts = request_facts(&request, &transform.client);
+            request.extensions_mut().insert(ResolvedClient(facts.ip));
 
             // The reference's CORS preflight short-circuit: an OPTIONS
             // request carrying `access-control-request-method` answers from
@@ -174,6 +158,18 @@ where
                 return Ok(response.map_into_boxed_body());
             }
 
+            // The reference `handle_passthrough`: an `exclude_paths` entry
+            // marks the request scoped (it keeps running the scoped
+            // pipeline below, never a whole-pipeline bypass); any other
+            // request with no resolvable client address is rejected under
+            // `fail_secure`, before every check.
+            let scoped = transform.exclusions.is_excluded(&facts.path);
+            if scoped {
+                request.extensions_mut().insert(crate::GuardExclusionScoped);
+            } else if facts.reject {
+                return Ok(unresolved_client_response(&request, &transform, &facts));
+            }
+
             // The reference `RouteConfigResolver`: the carrier extension
             // wins over the installed resolver (the app attaches the
             // route's config directly, the reference
@@ -188,6 +184,49 @@ where
                         .and_then(|resolver| resolver(&facts.method, &facts.path))
                 });
             let route = route_carrier.as_deref();
+
+            // The reference `RouteConfigResolver.should_bypass_check`: the
+            // named check, or the `"all"` wildcard.
+            let bypassed = |check: &str| {
+                route.is_some_and(|route| {
+                    route.bypassed_checks.contains("all") || route.bypassed_checks.contains(check)
+                })
+            };
+
+            // The reference `handle_security_bypass`: a route that bypasses
+            // `all` emits the `security_bypass` event, calls the real
+            // downstream and applies only the response modifier (no
+            // metrics, headers or return rules). Passive mode continues
+            // through the pipeline.
+            if route.is_some_and(|route| route.bypassed_checks.contains("all")) {
+                emit_security_bypass_event(&transform, &facts, route);
+                if !transform.passive_mode {
+                    return forward(
+                        &next,
+                        request,
+                        payload,
+                        &transform,
+                        &facts,
+                        started,
+                        Pass::ModifierOnly,
+                    )
+                    .await;
+                }
+            }
+
+            // The scoped pipeline of an excluded path (the reference
+            // `enforced_on_excluded_paths` checks): the ban check, the
+            // GLOBAL ip rules (gate, countries, cloud providers; no route
+            // lists, no auto-ban escalation), then the rate-limit tiers.
+            // Everything else (emergency mode, https, logging, body,
+            // headers, validators, scan, user agent, custom checks, usage
+            // rules, return rules) is skipped.
+            if scoped {
+                return scoped_pipeline(
+                    &next, request, payload, &transform, &mut facts, route, started,
+                )
+                .await;
+            }
 
             // The reference `process_usage_rules`: the route's usage and
             // frequency behavior rules track the request observation and a
@@ -223,14 +262,6 @@ where
                     ));
                 }
             }
-
-            // The reference `RouteConfigResolver.should_bypass_check`: the
-            // named check, or the `"all"` wildcard.
-            let bypassed = |check: &str| {
-                route.is_some_and(|route| {
-                    route.bypassed_checks.contains("all") || route.bypassed_checks.contains(check)
-                })
-            };
 
             // The reference `_check_route_ip_access` (inside the
             // `ip_security` block, before the global lists): the route's
@@ -323,10 +354,13 @@ where
             // the request, so the gate is skipped.
             if !bypassed("ip")
                 && !skip_global_ip_lists
-                && let Some(response) = enforce_ip_gate(&request, &transform)
+                && let Some(response) = enforce_ip_gate(&request, &transform, facts.ip)
             {
                 return Ok(finish_generated(&request, &transform, response));
             }
+            // The gate's skip state lands in the extensions when it runs:
+            // the geo, cloud and user-agent stages below read it.
+            facts.gate = request.extensions().get::<IpGateDecision>().copied();
 
             // Check 2: emergency mode (503 outside the whitelist). The
             // reference pipeline never consults the bypass set here: the
@@ -363,7 +397,7 @@ where
                         stage.decide_route(
                             &facts.path,
                             &facts.scheme,
-                            facts.host.as_deref().map(host_of_authority),
+                            facts.peer.as_deref(),
                             facts.x_forwarded_proto.as_deref(),
                             &https_url,
                             Some(route.require_https),
@@ -372,7 +406,7 @@ where
                         stage.decide(
                             &facts.path,
                             &facts.scheme,
-                            facts.host.as_deref().map(host_of_authority),
+                            facts.peer.as_deref(),
                             facts.x_forwarded_proto.as_deref(),
                             &https_url,
                         )
@@ -461,8 +495,14 @@ where
                 };
                 if rules.has_rules() {
                     let verifiers = guard_core_engine::headers_auth::RouteVerifiers {
-                        auth: route.auth_verifier.clone(),
-                        api_key: route.api_key_verifier.clone(),
+                        auth: route
+                            .auth_verifier
+                            .clone()
+                            .or_else(|| transform.auth_verifier.clone()),
+                        api_key: route
+                            .api_key_verifier
+                            .clone()
+                            .or_else(|| transform.auth_verifier.clone()),
                     };
                     let pairs: Vec<(String, String)> = request
                         .headers()
@@ -731,6 +771,11 @@ where
             // the global one for the request (an empty route list falls back
             // to the global config); an invalid route selector fails secure
             // (the reference validates at decoration time).
+            // The reference `CloudIpRefreshCheck`: schedule a range refresh
+            // when one is due.
+            if let Some(refresh) = &transform.cloud_refresh_gate {
+                let _ = refresh.refresh_if_due();
+            }
             if !bypassed("clouds") {
                 let route_selectors = route
                     .filter(|route| !route.block_cloud_providers.is_empty())
@@ -915,29 +960,16 @@ where
             // actix Web consumes the payload while buffering, so the
             // request the next service sees is rebuilt around the
             // buffered bytes (see the crate docs on request rebuilding).
-            let rebuilt =
-                ServiceRequest::from_parts(request, Payload::from(buffered.unwrap_or_default()));
-            let mut forwarded = next
-                .call(rebuilt)
-                .await
-                .map(ServiceResponse::map_into_boxed_body)?;
-            // The request metrics land as soon as the response head is back
-            // (the response time stops at response start).
-            if let Some(metrics) = transform.metrics.as_ref() {
-                metrics.collect_request_metrics(
-                    &facts.path,
-                    &facts.method,
-                    Some(started.elapsed().as_secs_f64()),
-                    forwarded.status().as_u16(),
-                );
-            }
-            run_response_processor(
+            forward(
+                &next,
+                request,
+                Payload::from(buffered.unwrap_or_default()),
                 &transform,
                 &facts,
-                forwarded.status().as_u16(),
-                forwarded.response_mut(),
-            );
-            Ok(forwarded)
+                started,
+                Pass::Full,
+            )
+            .await
         })
     }
 }
@@ -961,10 +993,23 @@ fn request_observation(request: &HttpRequest) -> RequestObservation {
     }
 }
 
+/// The resolved client identity, stored in the request extensions so every
+/// answer (block, redirect, failure) attributes to the same client the
+/// pipeline ran under.
+#[derive(Clone, Copy)]
+struct ResolvedClient(Option<std::net::IpAddr>);
+
 /// The request facts the pipeline stages read (the actix mirror of the
 /// tower adapter's `RequestFacts`).
 struct RequestFacts {
+    /// The resolved client (trusted-proxy aware); the identity every stage
+    /// runs under.
     ip: Option<std::net::IpAddr>,
+    /// The connecting peer address as text: the host the HTTPS stage
+    /// matches its trusted proxies against.
+    peer: Option<String>,
+    /// A peer-less request that cannot be resolved under `fail_secure`.
+    reject: bool,
     gate: Option<IpGateDecision>,
     ip_string: String,
     path: String,
@@ -978,15 +1023,25 @@ struct RequestFacts {
     query: String,
 }
 
-/// Extract the facts from an actix request: the peer address is the
-/// client identity, the connection info carries the host and scheme.
-fn request_facts(request: &HttpRequest) -> RequestFacts {
-    // Every extensions borrow lands in a local before the struct literal:
-    // `connection_info()` mutates the extensions cache internally, and a
-    // live immutable borrow inside the literal would double-borrow.
-    let ip = request.peer_addr().map(|peer| peer.ip());
+/// Extract the facts from an actix request. The client identity is the
+/// resolved one (the connecting peer, `X-Forwarded-For` through the trusted
+/// proxies); the scheme is the transport's own, never a header's claim.
+fn request_facts(request: &HttpRequest, policy: &ClientPolicy) -> RequestFacts {
+    let peer_ip = request.peer_addr().map(|peer| peer.ip());
+    let forwarded: Vec<&str> = request
+        .headers()
+        .get_all("x-forwarded-for")
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    let forwarded = (!forwarded.is_empty()).then(|| forwarded.join(", "));
+    let resolution = policy.resolve(peer_ip, forwarded.as_deref());
+    let ip = resolution.ip;
     let gate = request.extensions().get::<IpGateDecision>().copied();
-    let scheme = request.connection_info().scheme().to_owned();
+    // `connection_info().scheme()` honors `Forwarded` / `X-Forwarded-Proto`
+    // unconditionally, so a client could claim `https`. The HTTPS stage
+    // decides what to trust from the real scheme and the trusted proxies.
+    let transport = ["http", "https"][usize::from(request.app_config().secure())];
+    let scheme = request.uri().scheme_str().unwrap_or(transport).to_owned();
     let referer = header_string(request, header::REFERER);
     let user_agent = header_string(request, header::USER_AGENT);
     let host = header_string(request, header::HOST);
@@ -995,6 +1050,8 @@ fn request_facts(request: &HttpRequest) -> RequestFacts {
     let query = request.query_string();
     RequestFacts {
         ip,
+        peer: peer_ip.map(|addr| addr.to_string()),
+        reject: resolution.reject,
         gate,
         ip_string: ip.map_or_else(String::new, |addr| addr.to_string()),
         path: request.path().to_owned(),
@@ -1019,19 +1076,6 @@ fn header_string(request: &HttpRequest, name: header::HeaderName) -> Option<Stri
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
-}
-
-/// The bare host of an authority string (port stripped, IPv6 brackets
-/// removed): the connecting identity the trusted-proxy arm compares.
-fn host_of_authority(value: &str) -> &str {
-    let host_port = value.rsplit('@').next().unwrap_or_default();
-    if let Some(rest) = host_port.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
-    }
-    match host_port.split_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
-        _ => host_port,
-    }
 }
 
 /// The answer body of a geo/cloud/user-agent stage answer. The reference
@@ -1121,41 +1165,312 @@ fn finish_generated(
     transform: &GuardTransform,
     mut response: ServiceResponse,
 ) -> ServiceResponse {
-    run_response_processor_parts(
-        transform,
-        request,
-        response.status().as_u16(),
-        &mut response,
-    );
+    let pass = if request
+        .extensions()
+        .get::<crate::GuardExclusionScoped>()
+        .is_some()
+    {
+        Pass::Scoped
+    } else {
+        Pass::Full
+    };
+    let client_ip = request
+        .extensions()
+        .get::<ResolvedClient>()
+        .and_then(|client| client.0)
+        .map_or_else(String::new, |ip| ip.to_string());
+    let bits = RequestBits {
+        method: request.method().as_str().to_owned(),
+        url_path: request.path().to_owned(),
+        client_ip,
+        origin: request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned),
+    };
+    let status = response.status().as_u16();
+    let headers = compute_processor_headers(transform, &bits, status, None, pass);
+    response::apply_headers(response.response_mut(), headers);
     response
 }
 
-/// Run the response-side pass over a `ServiceResponse`.
-fn run_response_processor_parts(
-    transform: &GuardTransform,
+/// Which response-side pass a response gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Return rules, security headers, CORS, the modifier.
+    Full,
+    /// An `exclude_paths` request: no return rules, the rest as `Full`.
+    Scoped,
+    /// An all-checks-bypass route: only the modifier.
+    ModifierOnly,
+}
+
+/// The `403` a peer-less request answers under `fail_secure` (the reference
+/// `handle_passthrough`), through the normal block path: the response pass
+/// and the `on_block` hook (`client_address_unresolved`).
+fn unresolved_client_response(
     request: &HttpRequest,
-    status: u16,
-    response: &mut ServiceResponse,
-) {
-    if transform.response_processor.as_ref().is_none() {
-        return;
-    }
-    let headers = compute_processor_headers(
-        transform,
-        request.method().as_str(),
-        request.path(),
-        request
-            .peer_addr()
-            .map_or_else(String::new, |peer| peer.ip().to_string())
-            .as_str(),
-        request
-            .headers()
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok()),
-        status,
+    transform: &GuardTransform,
+    facts: &RequestFacts,
+) -> ServiceResponse {
+    let sensitive = transform
+        .observability()
+        .map(|observability| observability.sensitive.clone())
+        .unwrap_or_default();
+    let payload = build_block_payload(
+        guard_core_engine::ip_extraction::UNRESOLVABLE_CLIENT_ADDRESS_CHECK_NAME,
+        guard_core_engine::ip_extraction::UNRESOLVABLE_CLIENT_ADDRESS_MESSAGE,
+        "",
+        false,
+        guard_core_engine::ip_extraction::UNKNOWN_CLIENT_IDENTITY,
+        &facts.path,
+        &facts.method,
+        Some(guard_core_engine::ip_extraction::UNRESOLVABLE_CLIENT_ADDRESS_STATUS),
+        &sensitive,
     );
-    let http = response.response_mut();
-    response::apply_headers(http, headers);
+    fire_block_hook(transform.on_block(), &payload);
+    block_response(
+        request,
+        transform,
+        guard_core_engine::ip_extraction::UNRESOLVABLE_CLIENT_ADDRESS_STATUS,
+        guard_core_engine::ip_extraction::UNRESOLVABLE_CLIENT_ADDRESS_MESSAGE,
+    )
+}
+
+/// The `security_bypass` event of an all-checks-bypass route (the reference
+/// `handle_security_bypass`).
+fn emit_security_bypass_event(
+    transform: &GuardTransform,
+    facts: &RequestFacts,
+    route: Option<&RouteConfig>,
+) {
+    let Some(bus) = &transform.events else {
+        return;
+    };
+    let mut event = guard_core_rs::events::SecurityEvent::new(
+        guard_core_rs::event_types::EVENT_SECURITY_BYPASS,
+        &facts.ip_string,
+        "all_checks_bypassed",
+        "Route configured to bypass all security checks",
+        guard_core_rs::events::MIDDLEWARE_HANDLER_NAME,
+    );
+    let sensitive = transform
+        .observability()
+        .map(|observability| observability.sensitive.clone())
+        .unwrap_or_default();
+    event.endpoint = Some(guard_core_rs::redact::redact_url_for_display(
+        &facts.path,
+        &sensitive,
+    ));
+    event.method = Some(facts.method.clone());
+    event.user_agent.clone_from(&facts.user_agent);
+    let checks: Vec<serde_json::Value> = route
+        .into_iter()
+        .flat_map(|route| route.bypassed_checks.iter())
+        .map(|check| serde_json::Value::String(check.clone()))
+        .collect();
+    event.metadata.insert(
+        "bypassed_checks".to_owned(),
+        serde_json::Value::Array(checks),
+    );
+    bus.send_event(&event);
+}
+
+/// Forward the request to the next service and run the response-side pass
+/// over the answer.
+async fn forward<S, B>(
+    next: &Rc<S>,
+    request: HttpRequest,
+    payload: Payload,
+    transform: &GuardTransform,
+    facts: &RequestFacts,
+    started: std::time::Instant,
+    pass: Pass,
+) -> Result<ServiceResponse, Error>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    B: MessageBody + 'static,
+{
+    let rebuilt = ServiceRequest::from_parts(request, payload);
+    let forwarded = next
+        .call(rebuilt)
+        .await
+        .map(ServiceResponse::map_into_boxed_body)?;
+    Ok(finish_forwarded(transform, facts, forwarded, started, pass).await)
+}
+
+/// The scoped pipeline of an `exclude_paths` request: bans, the global IP
+/// rules, then the rate-limit tiers, and the scoped response pass.
+async fn scoped_pipeline<S, B>(
+    next: &Rc<S>,
+    request: HttpRequest,
+    payload: Payload,
+    transform: &GuardTransform,
+    facts: &mut RequestFacts,
+    route: Option<&RouteConfig>,
+    started: std::time::Instant,
+) -> Result<ServiceResponse, Error>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    B: MessageBody + 'static,
+{
+    let bypassed = |check: &str| {
+        route.is_some_and(|route| {
+            route.bypassed_checks.contains("all") || route.bypassed_checks.contains(check)
+        })
+    };
+    let stage = transform
+        .stage()
+        .expect("the stage is built by Transform::new_transform");
+    let observation = request_observation(&request);
+    if !bypassed("ip_ban")
+        && let Some(blocked) = stage.decide_bans_observed(facts.ip, Some(&observation))
+    {
+        return Ok(finish_generated(
+            &request,
+            transform,
+            response::stage(request.clone(), &blocked),
+        ));
+    }
+    if let Some(response) = enforce_ip_gate(&request, transform, facts.ip) {
+        return Ok(finish_generated(&request, transform, response));
+    }
+    facts.gate = request.extensions().get::<IpGateDecision>().copied();
+    if let Some(stage) = transform.geo_blocking()
+        && let Some(decision) = stage.decide(facts.ip, facts.gate)
+    {
+        return Ok(block_response(
+            &request,
+            transform,
+            decision.answer.status.as_u16(),
+            stage_answer_body(&decision.answer),
+        ));
+    }
+    if let Some(stage) = transform.cloud_provider()
+        && let Some(decision) = stage.decide(facts.ip, facts.gate)
+    {
+        return Ok(block_response(
+            &request,
+            transform,
+            decision.answer.status.as_u16(),
+            stage_answer_body(&decision.answer),
+        ));
+    }
+    let carrier_tiers = match route.map(RouteConfig::rate_limits) {
+        Some(Ok(tiers)) => tiers,
+        Some(Err(_)) => {
+            return Ok(finish_generated(
+                &request,
+                transform,
+                response::failure(request.clone()),
+            ));
+        }
+        None => None,
+    };
+    let extension_tiers = request.extensions().get::<RouteRateLimits>().cloned();
+    let effective_tiers = carrier_tiers.as_ref().or(extension_tiers.as_ref());
+    if !bypassed("rate_limit")
+        && let Some(blocked) = stage.decide_tiers_observed(
+            facts.ip,
+            Some(&facts.path),
+            effective_tiers,
+            facts.gate,
+            None,
+            Some(&observation),
+        )
+    {
+        return Ok(finish_generated(
+            &request,
+            transform,
+            response::stage(request.clone(), &blocked),
+        ));
+    }
+    forward(
+        next,
+        request,
+        payload,
+        transform,
+        facts,
+        started,
+        Pass::Scoped,
+    )
+    .await
+}
+
+/// The forwarded response: the request metrics, the buffered body when a
+/// return rule reads it, then the response-side pass.
+async fn finish_forwarded(
+    transform: &GuardTransform,
+    facts: &RequestFacts,
+    mut forwarded: ServiceResponse,
+    started: std::time::Instant,
+    pass: Pass,
+) -> ServiceResponse {
+    let status = forwarded.status().as_u16();
+    if pass != Pass::ModifierOnly
+        && let Some(metrics) = transform.metrics.as_ref()
+    {
+        // The response time stops at the response head, like the reference.
+        metrics.collect_request_metrics(
+            &facts.path,
+            &facts.method,
+            Some(started.elapsed().as_secs_f64()),
+            status,
+        );
+    }
+    let mut prefix: Option<Bytes> = None;
+    if pass == Pass::Full
+        && let Some(processor) = transform.response_processor.as_ref()
+        && processor.needs_response_body()
+    {
+        let max = processor.max_inspect_bytes();
+        match buffer_response_body(forwarded, transform).await {
+            Ok((response, bytes)) => {
+                prefix = Some(bytes.slice(..bytes.len().min(max)));
+                forwarded = response;
+            }
+            Err(failed) => return *failed,
+        }
+    }
+    run_response_processor(
+        transform,
+        facts,
+        status,
+        forwarded.response_mut(),
+        prefix.as_deref(),
+        pass,
+    );
+    forwarded
+}
+
+/// Buffer a forwarded response body for the body rules and rebuild the
+/// response around the full buffered bytes. A read error or a timeout
+/// (`body_read_timeout`) answers the fail-secure `500`: the consumed stream
+/// cannot be replayed.
+async fn buffer_response_body(
+    forwarded: ServiceResponse,
+    transform: &GuardTransform,
+) -> Result<(ServiceResponse, Bytes), Box<ServiceResponse>> {
+    let (request, response) = forwarded.into_parts();
+    let (head, body) = response.into_parts();
+    let read = actix_web::body::to_bytes(body);
+    let bytes = match transform.body_read_timeout {
+        Some(limit) => actix_web::rt::time::timeout(limit, read)
+            .await
+            .ok()
+            .and_then(Result::ok),
+        None => read.await.ok(),
+    };
+    let Some(bytes) = bytes else {
+        return Err(Box::new(finish_generated(
+            &request,
+            transform,
+            response::failure(request.clone()),
+        )));
+    };
+    let rebuilt = head.set_body(actix_web::body::BoxBody::new(bytes.clone()));
+    Ok((ServiceResponse::new(request, rebuilt), bytes))
 }
 
 /// Run the response-side pass over a forwarded response (the request was
@@ -1165,27 +1480,29 @@ fn run_response_processor_parts(
 /// security-header set lands and a bus is installed, the composed event
 /// dispatches (the reference `process_response` passes the request path,
 /// so the event fires). Guard-generated answers run
-/// [`run_response_processor_parts`] instead, and that lane applies the
-/// headers without firing - the reference `create_error_response` lane,
-/// where the event sits behind the request path.
+/// [`finish_generated`] instead, and that lane applies the headers without
+/// firing - the reference `create_error_response` lane, where the event
+/// sits behind the request path. The modifier-only pass never fires it.
 fn run_response_processor(
     transform: &GuardTransform,
     facts: &RequestFacts,
     status: u16,
     response: &mut actix_web::HttpResponse,
+    body_prefix: Option<&[u8]>,
+    pass: Pass,
 ) {
-    let Some(processor) = transform.response_processor.as_ref() else {
-        return;
+    let bits = RequestBits {
+        method: facts.method.clone(),
+        url_path: facts.path.clone(),
+        client_ip: facts.ip_string.clone(),
+        origin: facts.origin.clone(),
     };
-    let headers = compute_processor_headers(
-        transform,
-        &facts.method,
-        &facts.path,
-        &facts.ip_string,
-        facts.origin.as_deref(),
-        status,
-    );
-    emit_headers_applied_event(transform, processor, &facts.path, &facts.ip_string);
+    let headers = compute_processor_headers(transform, &bits, status, body_prefix, pass);
+    if pass != Pass::ModifierOnly
+        && let Some(processor) = transform.response_processor.as_ref()
+    {
+        emit_headers_applied_event(transform, processor, &facts.path, &facts.ip_string);
+    }
     response::apply_headers(response, headers);
 }
 
@@ -1222,33 +1539,40 @@ fn emit_headers_applied_event(
 
 /// The response-side pass itself: the global `return_pattern` rules
 /// evaluate the response (a crossed `ban` lands in the processor's IP-ban
-/// store), then the security-header set and the CORS verdict headers
-/// compose. The response body is not captured (`body_prefix = None`):
-/// `status:` rules evaluate, body rules skip, exactly the reference's
-/// no-capture seam.
+/// store; `body_prefix` carries the buffered body when a rule reads it),
+/// then the security-header set and the CORS verdict headers compose, and
+/// the response modifier runs last - the processor's own (from the config)
+/// and then the layer's (`with_custom_response_modifier`), so a modifier
+/// installed without a processor still runs.
 fn compute_processor_headers(
     transform: &GuardTransform,
-    method: &str,
-    url_path: &str,
-    client_ip: &str,
-    origin: Option<&str>,
+    request: &RequestBits,
     status: u16,
+    body_prefix: Option<&[u8]>,
+    pass: Pass,
 ) -> Option<actix_web::http::header::HeaderMap> {
-    let processor = transform.response_processor.as_ref()?;
+    let processor = transform.response_processor.as_ref();
+    if processor.is_none() && transform.response_modifier.is_none() {
+        return None;
+    }
     let mut bits = ResponseBits {
         status,
         body: None,
         headers: BTreeMap::new(),
     };
-    let request = RequestBits {
-        method: method.to_owned(),
-        url_path: url_path.to_owned(),
-        client_ip: client_ip.to_owned(),
-        origin: origin.map(ToOwned::to_owned),
-    };
-    let _action = processor.process(&request, &mut bits, None, SystemTime::now());
+    if let Some(processor) = processor {
+        match pass {
+            Pass::Full => {
+                let _action = processor.process(request, &mut bits, body_prefix, SystemTime::now());
+            }
+            Pass::Scoped => {
+                let _action = processor.process_scoped(request, &mut bits, SystemTime::now());
+            }
+            Pass::ModifierOnly => processor.apply_modifier(request, &mut bits),
+        }
+    }
 
-    // The reference `custom_response_modifier`: the callback runs LAST
+    // The layer-level `custom_response_modifier`: the callback runs LAST
     // over the response view. A panicking callback restores the
     // unmodified view (the reference's except arm) and reports through
     // the `on_error` hook.
@@ -1262,7 +1586,7 @@ fn compute_processor_headers(
                 hook(
                     "custom_response_modifier",
                     "the response modifier panicked; returning unmodified response",
-                    &[("path".to_owned(), url_path.to_owned())],
+                    &[("path".to_owned(), request.url_path.clone())],
                 );
             }
         }
@@ -1292,8 +1616,8 @@ fn compute_processor_headers(
 
 /// Apply the configured IP gate to the request.
 ///
-/// Returns the `403 Forbidden` response when the gate denies the request IP
-/// (the request's peer address), rendering the reference `ip_filter` behavior
+/// Returns the `403 Forbidden` response when the gate denies the resolved
+/// client IP, rendering the reference `ip_filter` behavior
 /// end to end: passive mode logs the crossing and forwards (no gate decision
 /// reaches the rest of the pipeline, so the unattributed handling applies),
 /// the `on_block` hook fires once with the reference payload keys, and the
@@ -1301,12 +1625,16 @@ fn compute_processor_headers(
 /// gets the gate's [`IpGateDecision`] inserted into the request extensions
 /// (the family-local skip state, the equivalent of the reference engine's
 /// `state.is_whitelisted` / `state.is_exempt`) so downstream handlers can
-/// read it. Without a gate or without a peer address the request is not
+/// read it. Without a gate or without a resolved client the request is not
 /// attributed: the gate does not run, and nothing is inserted.
-fn enforce_ip_gate(request: &HttpRequest, transform: &GuardTransform) -> Option<ServiceResponse> {
+fn enforce_ip_gate(
+    request: &HttpRequest,
+    transform: &GuardTransform,
+    client: Option<std::net::IpAddr>,
+) -> Option<ServiceResponse> {
     let gate = transform.ip_gate()?;
-    let peer = request.peer_addr()?;
-    match gate.evaluate(peer.ip()) {
+    let client = client?;
+    match gate.evaluate(client) {
         IpGateVerdict::Allowed(decision) => {
             request.extensions_mut().insert(decision);
             None
@@ -1315,7 +1643,7 @@ fn enforce_ip_gate(request: &HttpRequest, transform: &GuardTransform) -> Option<
             if transform.passive_mode {
                 return None;
             }
-            let ip_string = peer.ip().to_string();
+            let ip_string = client.to_string();
             let body = resolve_error_body(
                 transform.custom_error_responses(),
                 403,
@@ -1583,6 +1911,7 @@ mod tests {
         let request = actix_web::test::TestRequest::default()
             .method(actix_web::http::Method::OPTIONS)
             .uri("/api")
+            .peer_addr("203.0.113.9:45000".parse().expect("addr"))
             .to_request();
         let response = actix_web::test::call_service(&app, request).await;
         assert_eq!(
@@ -3785,6 +4114,15 @@ mod tests {
     use guard_core_engine::security_config::SecurityConfig;
     use guard_core_rs::responses::OnBlockHook;
 
+    fn test_bits() -> RequestBits {
+        RequestBits {
+            method: "GET".to_owned(),
+            url_path: "/hello".to_owned(),
+            client_ip: "203.0.113.9".to_owned(),
+            origin: None,
+        }
+    }
+
     fn bare_processor() -> guard_core_rs::process_response::ResponseProcessor {
         guard_core_rs::process_response::ResponseProcessor::new(
             Some(guard_core_engine::security_headers::SecurityHeadersConfig::reference_default()),
@@ -3909,16 +4247,32 @@ mod tests {
         );
     }
 
+    struct NoCountry;
+
+    impl guard_core_engine::geo::GeoIpHandler for NoCountry {
+        fn get_country(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+    }
+
     #[actix_web::test]
     async fn the_country_level_alone_installs_observability_and_composes() {
         let config = SecurityConfig {
             log_suspicious_level: None,
             blocked_countries: [String::from("RU")].into_iter().collect(),
+            geo_ip_handler: Some(Arc::new(NoCountry)),
             ..SecurityConfig::default()
         };
         let transform = GuardTransform::from_security_config(&config).expect("valid config");
         let observability = transform.observability().expect("the country default");
         assert_eq!(observability.log_suspicious_level, None);
+        assert_eq!(
+            guard_core_engine::geo::GeoIpHandler::get_country(
+                &NoCountry,
+                "203.0.113.9".parse().expect("ip")
+            ),
+            None
+        );
 
         // A dispatch through the geo position composes the verdict line
         // (the geo stage is a host-provided collaborator).
@@ -3947,9 +4301,8 @@ mod tests {
                 bits.headers
                     .insert("X-Modified-By".to_owned(), "guard".to_owned());
             }));
-        let headers =
-            compute_processor_headers(&transform, "GET", "/hello", "203.0.113.9", None, 200)
-                .expect("headers");
+        let headers = compute_processor_headers(&transform, &test_bits(), 200, None, Pass::Full)
+            .expect("headers");
         assert_eq!(
             headers
                 .get("x-modified-by")
@@ -3974,9 +4327,8 @@ mod tests {
                     .expect("sink")
                     .push((stage.to_owned(), error.to_owned()));
             }));
-        let headers =
-            compute_processor_headers(&transform, "GET", "/hello", "203.0.113.9", None, 200)
-                .expect("headers");
+        let headers = compute_processor_headers(&transform, &test_bits(), 200, None, Pass::Full)
+            .expect("headers");
         assert!(
             headers.get("x-content-type-options").is_some(),
             "the security headers survive the panicking modifier"
@@ -4060,17 +4412,24 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn from_security_config_exclude_paths_bypass_the_pipeline() {
+    async fn from_security_config_exclude_paths_run_the_scoped_pipeline() {
         let config = SecurityConfig {
             blacklist: vec![String::from("203.0.113.9")],
             exclude_paths: vec![String::from("/docs")],
             ..SecurityConfig::default()
         };
         let transform = GuardTransform::from_security_config(&config).expect("valid config");
-        // An excluded path bypasses every check, gate included: the
-        // blacklisted IP forwards on /docs.
-        let (bypassed, _) =
+        // An excluded path runs the scoped pipeline: the global IP gate
+        // still applies, so the blacklisted IP is denied on /docs too.
+        let (scoped, _) =
             status_body(transform.clone(), config_request("203.0.113.9", "/docs")).await;
+        assert_eq!(scoped, StatusCode::FORBIDDEN);
+        // A clean IP on the excluded path forwards, attack and all.
+        let (bypassed, _) = status_body(
+            transform.clone(),
+            config_request("203.0.113.10", "/docs/x?q=1%20UNION%20SELECT%20password"),
+        )
+        .await;
         assert_eq!(bypassed, StatusCode::OK);
         // Any other path takes the gate denial.
         let (blocked, _) = status_body(transform, config_request("203.0.113.9", "/hello")).await;
@@ -4324,16 +4683,17 @@ mod tests {
     }
 
     #[test]
-    fn from_security_config_empty_category_set_skips_the_exclusion_block() {
-        // The reference's empty `enabled_detection_categories` frozenset:
-        // an explicitly empty set disables every category, and the
-        // detection-exclusion block is not installed at all.
+    fn from_security_config_empty_category_set_leaves_the_category_filter_off() {
+        // The wiring treats an empty `enabled_detection_categories` as no
+        // category filter; the detection-exclusion block itself is always
+        // installed (the scan reads its body toggle and scan budget).
         let config = SecurityConfig {
             enabled_detection_categories: std::collections::BTreeSet::new(),
             ..SecurityConfig::default()
         };
         let transform = GuardTransform::from_security_config(&config).expect("valid config");
-        assert!(transform.detection_exclusions().is_none());
+        let exclusions = transform.detection_exclusions().expect("always installed");
+        assert!(exclusions.enabled_detection_categories.is_none());
     }
 
     #[test]
@@ -4394,30 +4754,6 @@ mod tests {
         .into();
         assert!(ban.to_string().contains("ip ban"));
         assert!(std::error::Error::source(&ban).is_some());
-    }
-
-    #[test]
-    fn map_log_level_covers_every_reference_level() {
-        assert!(matches!(
-            crate::map_log_level(guard_core_engine::security_config::LogLevel::Info),
-            guard_core_rs::logging::LogLevel::Info
-        ));
-        assert!(matches!(
-            crate::map_log_level(guard_core_engine::security_config::LogLevel::Debug),
-            guard_core_rs::logging::LogLevel::Debug
-        ));
-        assert!(matches!(
-            crate::map_log_level(guard_core_engine::security_config::LogLevel::Warning),
-            guard_core_rs::logging::LogLevel::Warning
-        ));
-        assert!(matches!(
-            crate::map_log_level(guard_core_engine::security_config::LogLevel::Error),
-            guard_core_rs::logging::LogLevel::Error
-        ));
-        assert!(matches!(
-            crate::map_log_level(guard_core_engine::security_config::LogLevel::Critical),
-            guard_core_rs::logging::LogLevel::Critical
-        ));
     }
 
     // --- the reference RouteConfig carrier consumption (GAP-R2) ---

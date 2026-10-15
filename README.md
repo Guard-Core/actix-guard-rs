@@ -206,6 +206,7 @@ Scan notes: the query string is scanned as `parse_qsl`-decoded per-parameter pai
 
 | Situation | Status | Body |
 |---|---|---|
+| No peer address and no resolvable client under `fail_secure` | `403 Forbidden` | `Client address could not be determined` |
 | The IP gate denies the client IP | `403 Forbidden` | `Forbidden` |
 | A live ban on the client IP | `403 Forbidden` | `IP address banned` |
 | Rate limit crossed | `429 Too Many Requests` (+ `Retry-After: <window>`) | `Too many requests` |
@@ -254,6 +255,20 @@ let transform = actix_guard_rs::GuardTransform::new(actix_guard_rs::default_conf
 - Both stages honor the `exempt_ips` contract: whitelisted and exempt IPs are never rate limited, never banned, and never counted; unattributed requests (no peer address) skip the stage but are still detection-screened.
 - The limiter, ban store, and violation counters are shared across all workers through an `Arc`, and the engine handles are cheaply clonable, so out-of-band handles (admin unban endpoints, stats) work alongside the installed transform.
 
+## Client resolution
+
+The actix peer address is the connecting peer. The identity every stage runs under (gate, bans, rate limit, geo, cloud, events, the response pass) is resolved from it with the reference rules: `X-Forwarded-For` counts only behind a trusted proxy (`trusted_proxies`, `trusted_proxy_depth`), and an IPv4-mapped IPv6 peer is canonicalized. A request with no peer address and no resolvable client answers `403 Client address could not be determined` under `fail_secure`, before any check, and the `on_block` hook sees check name `client_address_unresolved`. With `fail_secure = false` it continues unattributed. Bare layers default to no proxies and `fail_secure = false`, so existing hosts that supply no peer keep passing; `.with_client_policy(ClientPolicy { .. })` installs a policy and `from_security_config` installs the config's (`fail_secure` defaults to `true`). The WebSocket guard takes the same policy through `WebSocketGuardConfig::with_client_policy`. The HTTPS stage decides `X-Forwarded-Proto` trust from the real peer and the real scheme, never from a header's claim.
+
+## Excluded paths
+
+`exclude_paths` uses the reference matcher: `/static` covers `/static` and `/static/app.js` and never `/staticx`, and percent-encoding and dot segments are resolved before matching. An excluded request is scoped, not bypassed. It carries the `GuardExclusionScoped` extension and runs route resolution, the ban check, the global IP lists, country and cloud rules, and the rate limit. Emergency mode, HTTPS enforcement, request logging, the body cap, headers and auth, validators, the scan, the user-agent filter, custom checks and the return rules are skipped. The response still gets metrics, security headers, CORS and the modifier. The CORS preflight short-circuit runs before the exclusion decision. A route carrier that bypasses `all` checks skips the pipeline: the `security_bypass` event fires and only the modifier runs on the response (under `passive_mode` the request continues through the pipeline).
+
+## Config, agent and dynamic rules
+
+`GuardTransform::from_security_config(&config)` builds everything through the facade's `Wiring`, the one `SecurityConfig` mapping the Rust adapters share (the field-by-field table is in the `guard_core_rs::wiring` module docs). Geo country rules, cloud providers (with the per-request range refresh), `endpoint_rate_limits`, the rate-limit auto-ban, `custom_request_check`, `auth_verifier` (the fallback of a route's verifiers), `custom_response_modifier`, `on_error`, `cors_expose_headers`, `trusted_proxies` and the rest all land on the transform. The transform clones per actix worker and every clone shares the one set of rate-limit, ban and cloud stores.
+
+The telemetry agent is injected: build a `TelemetryHandler` from the `agent_*` fields with guard-agent-rs's `GuardAgentTelemetry` and call `GuardTransform::from_security_config_with(&config, &WiringOptions { agent: Some(agent), logfire_client: None })`. The agent feeds the event bus, the metrics collector, `agent_stats()` and the dynamic rules. Wiring starts nothing: call `transform.telemetry()` and its `start()` / `stop()`, and `transform.spawn_dynamic_rules()` starts the poll loop (drop the handle to stop it). Body `return_pattern` rules buffer the forwarded response body (bounded in time by `body_read_timeout`, a read error or timeout answers `500`) and re-emit it intact, so do not combine them with endless streaming responses.
+
 ## Body cap
 
 Request bodies are buffered so the engine can inspect them, and the buffer is bounded. The cap defaults to the engine's full-scan cap (`DetectConfig::max_full_scan_bytes`, 262 144 bytes in the ecosystem default) and is configurable:
@@ -275,7 +290,7 @@ actix Web consumes a request's payload as it is read, so the middleware buffers 
 
 ## Status route
 
-`status::GuardStatus` is the `add_status_route` mirror (fastapi-guard `guard/status.py` + `HandlerInitializer.get_initialization_status`): `App::service(GuardStatus::new().with_cloud_table(table).with_geo_configured(true))` mounts `GET /_guard/status` (`status::DEFAULT_STATUS_PATH`), serving the cloud-provider status table (`{"ready":..., "last_refreshed":<unix-seconds|null>, "entries":N}` per provider from the live `CloudIpTable`) and the geo-ip component (`null` without a handler, `{"configured":true}` with the lookup trait only, the `{ready, last_refreshed, entries}` health snapshot with the `IpInfoManager` lifecycle manager). The maintenance trio lives on `GuardTransform`: `reset()` drops the rate-limit windows, `refresh_cloud_ip_ranges()` schedules one single-flight refresh through `with_cloud_refresh_scheduler`, and `agent_stats()` answers the reference property's no-agent shape.
+`status::GuardStatus` is the `add_status_route` mirror (fastapi-guard `guard/status.py` + `HandlerInitializer.get_initialization_status`): `App::service(GuardStatus::new().with_cloud_table(table).with_geo_configured(true))` mounts `GET /_guard/status` (`status::DEFAULT_STATUS_PATH`), serving the cloud-provider status table (`{"ready":..., "last_refreshed":<unix-seconds|null>, "entries":N}` per provider from the live `CloudIpTable`) and the geo-ip component (`null` without a handler, `{"configured":true}` with the lookup trait only, the `{ready, last_refreshed, entries}` health snapshot with the `IpInfoManager` lifecycle manager). The maintenance trio lives on `GuardTransform`: `reset()` drops the rate-limit windows, `refresh_cloud_ip_ranges()` schedules one single-flight refresh through `with_cloud_refresh_scheduler`, and `agent_stats()` reports whether a telemetry sink is wired and whether its start degraded (see [Config, agent and dynamic rules](#config-agent-and-dynamic-rules)).
 
 ## Engine dependency
 
@@ -289,8 +304,10 @@ Every reference check the engine ships is installable on `GuardTransform`, and `
 
 ## Not wired on purpose
 
-- **WebSocket guard**: the middleware screens a WebSocket upgrade handshake like any request; frames after the upgrade are not intercepted. There is no per-frame guard surface.
-- **Status route**: no `add_status_route` equivalent ships (a gap tracked family-wide); expose engine state through your own route if you need it.
+- **WebSocket frames**: the guard screens the upgrade handshake (the `WebSocketGuard` transform above); frames after the upgrade are not intercepted, there is no per-frame surface.
+- **`route_resolution_strict`**: actix resolves routes after the middleware runs, so the adapter cannot tell an unresolved route apart. The knob stays on the config.
+- **Request-body read timeout**: actix's own client request timeout owns that seam; `body_read_timeout` bounds the response-body read the return rules need.
+- **The `redis` backend**: the adapter does not enable `guard-core-rs`'s `redis` feature. Enable it in your own `Cargo.toml` and `enable_redis` plus `redis_url` wire the shared stores; otherwise limits and bans stay per process.
 
 ## Development
 

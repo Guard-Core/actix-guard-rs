@@ -73,7 +73,7 @@ The next service is shared through an `Rc<S>` (`GuardService`), not cloned: the 
 
 ## Development Commands
 
-CI is the source of truth (`.github/workflows/ci.yml`); there is no Makefile.
+CI is the source of truth (`.github/workflows/ci.yml`); the Makefile wraps the same commands over the whole workspace (`make test`, `make lint`).
 
 ```bash
 cargo check --all-targets                              # type check
