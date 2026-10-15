@@ -188,6 +188,7 @@ impl TelemetryHandler for Sink {
 fn agent_config() -> SecurityConfig {
     SecurityConfig {
         enable_agent: true,
+        agent_api_key: Some("a-key-of-at-least-ten".to_owned()),
         agent_enable_events: true,
         agent_enable_metrics: true,
         rate_limit: 1,
@@ -280,7 +281,9 @@ fn the_dynamic_rule_poll_loop_is_host_started() {
         dynamic_rule_interval: 1,
         ..agent_config()
     };
-    let transform = GuardTransform::from_security_config_with(
+    // The unvalidated seam: the poll loop test runs on a one second interval,
+    // below the validated range.
+    let wiring = Wiring::build_unvalidated(
         &config,
         &WiringOptions {
             agent: Some(Arc::clone(&sink) as Arc<dyn TelemetryHandler>),
@@ -288,6 +291,7 @@ fn the_dynamic_rule_poll_loop_is_host_started() {
         },
     )
     .expect("valid config");
+    let transform = GuardTransform::from_wiring(wiring);
     assert_eq!(
         sink.polls.load(Ordering::SeqCst),
         0,
