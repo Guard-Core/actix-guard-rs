@@ -4239,6 +4239,55 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
+    #[test]
+    fn from_security_config_semantic_header_exclusions_reach_the_engine_config() {
+        let config = SecurityConfig {
+            excluded_semantic_detection_headers: [String::from("Cookie")].into_iter().collect(),
+            enabled_detection_categories: std::collections::BTreeSet::new(),
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let installed = transform
+            .detection_exclusions()
+            .expect("the semantic header set alone installs the block");
+        assert_eq!(
+            installed.excluded_semantic_detection_headers,
+            vec![String::from("Cookie")]
+        );
+    }
+
+    #[actix_web::test]
+    async fn from_security_config_scan_time_budget_reaches_the_scan() {
+        let transform =
+            GuardTransform::from_security_config(&SecurityConfig::default()).expect("valid");
+        let (status, _) = status_body(transform, config_request("203.0.113.9", "/hello")).await;
+        assert_eq!(status, StatusCode::OK, "the default budget leaves it alone");
+
+        // A spent cap fails closed: the engine's scan answers a threat even
+        // for a benign request.
+        let spent = SecurityConfig {
+            detection_max_scan_seconds: 0.0,
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&spent).expect("valid");
+        let (status, _) = status_body(transform, config_request("203.0.113.9", "/hello")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn from_security_config_custom_scan_time_cap_alone_installs_the_block() {
+        let config = SecurityConfig {
+            enabled_detection_categories: std::collections::BTreeSet::new(),
+            detection_max_scan_seconds: 2.5,
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        let installed = transform
+            .detection_exclusions()
+            .expect("the cap installs it");
+        assert_eq!(installed.max_scan_seconds, Some(2.5));
+    }
+
     #[actix_web::test]
     async fn from_security_config_security_headers_and_cors_render() {
         let config = SecurityConfig {
