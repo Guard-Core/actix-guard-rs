@@ -47,6 +47,7 @@ use guard_core_engine::geo::{CountryGate, GeoIpHandler, check_countries};
 use guard_core_engine::ip_ban::IpBanManager;
 use guard_core_engine::ip_gate::{IpGateConfig, IpGateVerdict};
 use guard_core_engine::rate_limit::RateLimiter;
+use guard_core_rs::wiring::ClientPolicy;
 use std::future::{Ready, ready};
 use std::net::IpAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -171,7 +172,7 @@ pub struct WebSocketGuardConfig {
     ban_manager: Option<IpBanManager>,
     rate_limiter: Option<RateLimiter>,
     country_rules: Option<(CountryGate, Arc<dyn GeoIpHandler>)>,
-    fail_secure: bool,
+    client: ClientPolicy,
     exclusions: ResolvedExclusions,
 }
 
@@ -185,7 +186,7 @@ impl core::fmt::Debug for WebSocketGuardConfig {
             .field("ip_gate", &self.ip_gate)
             .field("ban_manager", &self.ban_manager)
             .field("rate_limiter", &self.rate_limiter)
-            .field("fail_secure", &self.fail_secure)
+            .field("client", &self.client)
             .field("exclusions", &self.exclusions)
             .finish_non_exhaustive()
     }
@@ -202,7 +203,11 @@ impl WebSocketGuardConfig {
             ban_manager: None,
             rate_limiter: None,
             country_rules: None,
-            fail_secure: false,
+            client: ClientPolicy {
+                trusted_proxies: Vec::new(),
+                trusted_proxy_depth: 1,
+                fail_secure: false,
+            },
             exclusions: resolve_exclusions(None, None),
         }
     }
@@ -243,7 +248,17 @@ impl WebSocketGuardConfig {
     /// determined (the reference `fail_secure` arm).
     #[must_use]
     pub const fn with_fail_secure(mut self, fail_secure: bool) -> Self {
-        self.fail_secure = fail_secure;
+        self.client.fail_secure = fail_secure;
+        self
+    }
+
+    /// Install the client resolution policy (trusted proxies, proxy depth,
+    /// `fail_secure`), the same policy the HTTP guard resolves the upgrade
+    /// request's client with: behind a trusted proxy the forwarded client,
+    /// not the proxy, is banned, gated and rate limited.
+    #[must_use]
+    pub fn with_client_policy(mut self, client: ClientPolicy) -> Self {
+        self.client = client;
         self
     }
 
@@ -270,9 +285,20 @@ struct WebSocketRequestParts {
 }
 
 impl WebSocketRequestParts {
-    fn extract(request: &HttpRequest) -> Self {
+    fn extract(request: &HttpRequest, client: &ClientPolicy) -> Self {
+        let forwarded: Vec<&str> = request
+            .headers()
+            .get_all("x-forwarded-for")
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        let forwarded = (!forwarded.is_empty()).then(|| forwarded.join(", "));
         Self {
-            client_ip: request.peer_addr().map(|peer| peer.ip()),
+            client_ip: client
+                .resolve(
+                    request.peer_addr().map(|peer| peer.ip()),
+                    forwarded.as_deref(),
+                )
+                .ip,
             url_path: request.path().to_owned(),
             query_params: parse_query_pairs(request.query_string()),
             headers: request
@@ -352,7 +378,7 @@ pub fn run_websocket_checks(
     query_params: &[(String, String)],
     headers: &[(String, String)],
 ) -> Result<(), WebSocketCloseReason> {
-    if client_ip.is_none() && config.fail_secure {
+    if client_ip.is_none() && config.client.fail_secure {
         return Err(WS_CLOSE_CLIENT_ADDRESS_UNKNOWN);
     }
 
@@ -496,7 +522,7 @@ impl<S> WebSocketGuardService<S> {
     /// programmatic seam: the same sequence the middleware runs). `Err`
     /// carries the close shape the handshake must be rejected with.
     pub fn upgrade_verdict(&self, request: &HttpRequest) -> Result<(), WebSocketCloseReason> {
-        let parts = WebSocketRequestParts::extract(request);
+        let parts = WebSocketRequestParts::extract(request, &self.config.client);
         run_checks_guarded(&self.config, &parts)
     }
 }
