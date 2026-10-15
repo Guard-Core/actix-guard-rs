@@ -120,9 +120,11 @@ let transform = GuardTransform::new(actix_guard_rs::default_config()).with_ip_ga
 Evaluation order mirrors the reference engine: with a non-empty `whitelist`,
 an IP matching neither the whitelist nor `exempt_ips` is denied; otherwise a
 `blacklist` hit is denied. Both denials answer `403 Forbidden` with
-`Forbidden` before body buffering. The client IP is the request's peer
-address; a request without one is not attributed, the gate does not run, and
-detection still screens it. A passed request gets an
+`Forbidden` before body buffering. The client IP is the resolved client (the
+peer address, or the forwarded client behind a trusted proxy, see
+`GuardTransform::with_client_policy`); a request without one is not
+attributed, the gate does not run, and detection still screens it (a config
+built with `from_security_config` rejects it under `fail_secure`). A passed request gets an
 `IpGateDecision { is_whitelisted, is_exempt }` inserted into its request
 extensions so downstream handlers can read the skip state.
 
