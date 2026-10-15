@@ -667,13 +667,23 @@ impl GuardTransform {
         // field; clippy calls it needless while the field list is complete.
         #[allow(clippy::needless_update)]
         if !config.excluded_detection_headers.is_empty()
+            || !config.excluded_semantic_detection_headers.is_empty()
             || !config.excluded_detection_params.is_empty()
             || !config.excluded_detection_body_fields.is_empty()
             || !config.enabled_detection_categories.is_empty()
+            || (config.detection_max_scan_seconds
+                - guard_core_engine::scan_budget::DEFAULT_MAX_SCAN_SECONDS)
+                .abs()
+                > f64::EPSILON
         {
             transform = transform.with_detection_exclusions(DetectionExclusionConfig {
                 excluded_detection_headers: config
                     .excluded_detection_headers
+                    .iter()
+                    .cloned()
+                    .collect(),
+                excluded_semantic_detection_headers: config
+                    .excluded_semantic_detection_headers
                     .iter()
                     .cloned()
                     .collect(),
@@ -696,6 +706,7 @@ impl GuardTransform {
                             .collect()
                     }),
                 detection_scan_body: Some(config.detection_scan_body),
+                max_scan_seconds: Some(config.detection_max_scan_seconds),
                 ..DetectionExclusionConfig::default()
             });
         }
