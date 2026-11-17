@@ -629,7 +629,7 @@ where
                     timezone: restrictions.get("timezone").cloned(),
                 };
                 let current = guard_core_engine::time_window::hhmm_in_zone(
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                     window.timezone.as_deref(),
                 );
                 if !guard_core_engine::time_window::is_within(&window, &current) {
@@ -5346,9 +5346,8 @@ mod tests {
 
     #[actix_web::test]
     async fn route_time_restrictions_gate_their_route() {
-        use chrono::Timelike;
-        let now = chrono::Utc::now();
-        let now_minutes = i64::from(now.hour() * 60 + now.minute());
+        let now = jiff::Timestamp::now().to_zoned_datetime(jiff::tz::TimeZone::UTC);
+        let now_minutes = i64::from(now.hour()) * 60 + i64::from(now.minute());
         // Both plain-span shapes exclude `now` by construction.
         let (late_start, late_end) = (now_minutes + 5, now_minutes + 10);
         let (early_start, early_end) = (now_minutes - 15, now_minutes - 10);
