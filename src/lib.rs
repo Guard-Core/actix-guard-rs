@@ -1861,6 +1861,56 @@ mod tests {
     }
 
     #[test]
+    fn reset_without_a_rate_limiter_changes_nothing() {
+        let transform = GuardTransform::new(default_config());
+        transform.reset();
+        assert!(transform.rate_limiter.is_none());
+    }
+
+    #[test]
+    fn a_config_without_ip_banning_installs_no_ban_state() {
+        let config = SecurityConfig {
+            enable_ip_banning: false,
+            ..SecurityConfig::default()
+        };
+        let transform = GuardTransform::from_security_config(&config).expect("valid config");
+        assert!(transform.ban_state.is_none());
+    }
+
+    #[actix_web::test]
+    async fn a_transform_that_already_holds_its_stage_keeps_it() {
+        use actix_web::HttpResponse;
+        let mut prebuilt = GuardTransform::new(default_config());
+        prebuilt.stage = Some(Arc::new(prebuilt.build_stage()));
+        let inner = actix_web::dev::fn_service(|request: ServiceRequest| async move {
+            Ok::<_, Error>(request.into_response(HttpResponse::Ok().finish()))
+        });
+        let service = prebuilt.new_transform(inner).await.expect("infallible");
+        let request = actix_web::test::TestRequest::get()
+            .uri("/hello")
+            .to_srv_request();
+        let response = service.call(request).await.expect("response");
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn a_live_config_that_no_longer_builds_installs_no_live_cell() {
+        let wiring = Wiring::from_security_config_with(
+            &SecurityConfig::default(),
+            &WiringOptions::default(),
+        )
+        .expect("valid config");
+        let context = wiring.live.clone();
+        context
+            .config()
+            .write()
+            .expect("live config")
+            .blocked_user_agents = vec![String::from("(")];
+        let transform = GuardTransform::new(default_config()).install_live(&context);
+        assert!(transform.live.is_none());
+    }
+
+    #[test]
     fn refresh_cloud_ip_ranges_answers_false_without_a_scheduler() {
         let transform = GuardTransform::new(default_config());
         assert!(!transform.refresh_cloud_ip_ranges());

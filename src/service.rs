@@ -4435,6 +4435,73 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_panicking_response_modifier_without_an_error_hook_still_restores() {
+        let transform = GuardTransform::new(default_config())
+            .with_response_processor(bare_processor())
+            .with_custom_response_modifier(Arc::new(|_bits: &mut ResponseBits| {
+                panic!("modifier exploded");
+            }));
+        let headers = compute_processor_headers(&transform, &test_bits(), 200, None, Pass::Full)
+            .expect("headers");
+        assert!(headers.get("x-content-type-options").is_some());
+    }
+
+    #[actix_web::test]
+    async fn a_generated_answer_reads_the_origin_header_of_the_request() {
+        let config = SecurityConfig {
+            blocked_user_agents: vec![String::from("bad-bot")],
+            ..SecurityConfig::default()
+        };
+        let request = TestRequest::get()
+            .uri("/hello")
+            .insert_header(("user-agent", "bad-bot/1.0"))
+            .insert_header(("origin", "https://app.example.com"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("203.0.113.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (status, _) = status_body(
+            GuardTransform::from_security_config(&config).expect("valid config"),
+            request,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[actix_web::test]
+    async fn a_preflight_header_the_response_cannot_carry_is_dropped() {
+        let transform = GuardTransform::from_security_config(&SecurityConfig {
+            enable_cors: true,
+            cors_allow_origins: vec!["https://app.example.com".to_owned()],
+            cors_allow_methods: vec!["POST".to_owned(), "X\nY".to_owned()],
+            ..SecurityConfig::default()
+        })
+        .expect("valid config");
+        let request = TestRequest::default()
+            .method(actix_web::http::Method::OPTIONS)
+            .uri("/api")
+            .insert_header(("Origin", "https://app.example.com"))
+            .insert_header(("Access-Control-Request-Method", "POST"))
+            .to_srv_request();
+        let guard = guarded(transform).await;
+        let response = guard.call(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("Access-Control-Allow-Methods")
+                .is_none()
+        );
+        assert!(
+            response
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .is_some()
+        );
+    }
+
+    #[actix_web::test]
     async fn from_security_config_defaults_screen_clean_traffic() {
         let config = SecurityConfig::default();
         let (status, _) = status_body(
@@ -5292,6 +5359,69 @@ mod tests {
             .with_route_configs(resolver_for(&[("GET", "/api")], config));
         let (status, _) = status_body(transform, carrier_request("GET", "/api", "192.0.2.9")).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn route_validators_receive_the_utf8_request_body() {
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let validator: guard_core_engine::custom_checks::CustomValidatorFn = Arc::new(move |ctx| {
+            *sink.lock().expect("sink") = ctx.body.map(str::to_owned);
+            None
+        });
+        let config = RouteConfig {
+            custom_validators: vec![validator],
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_route_configs(resolver_for(&[("POST", "/api")], config));
+        let request = TestRequest::post()
+            .uri("/api")
+            .set_payload("hello")
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("192.0.2.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (status, _) = status_body(transform, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.lock().expect("sink").as_deref(), Some("hello"));
+    }
+
+    #[actix_web::test]
+    async fn a_route_request_size_cap_above_the_body_lets_it_through() {
+        let config = RouteConfig {
+            max_request_size: Some(1_000_000),
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let (status, _) = status_body(transform, carrier_request("GET", "/api", "192.0.2.9")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn route_blocked_user_agents_apply_to_a_client_the_ip_gate_let_through() {
+        let gate = crate::IpGateConfig::new([] as [&str; 0], ["198.51.100.1"], [] as [&str; 0])
+            .expect("valid lists");
+        let config = RouteConfig {
+            blocked_user_agents: vec![String::from("route-bot")],
+            ..RouteConfig::default()
+        };
+        let transform = GuardTransform::new(default_config())
+            .with_ip_gate(gate)
+            .with_route_configs(resolver_for(&[("GET", "/api")], config));
+        let request = TestRequest::get()
+            .uri("/api")
+            .insert_header(("user-agent", "route-bot/2.0"))
+            .peer_addr(std::net::SocketAddr::new(
+                IpAddr::from_str("192.0.2.9").expect("test ip"),
+                45_000,
+            ))
+            .to_srv_request();
+        let (blocked, body, _) = full_status(transform, request).await;
+        assert_eq!(blocked, StatusCode::FORBIDDEN);
+        assert_eq!(body, "User-Agent not allowed");
     }
 
     #[actix_web::test]
